@@ -262,6 +262,54 @@ pub fn appendCurlResolveArgs(argv_buf: []([]const u8), argc: *usize, resolve_ent
     }
 }
 
+pub fn appendCurlConfigFlag(buf: *std.ArrayListUnmanaged(u8), allocator: Allocator, flag: []const u8) !void {
+    var name = flag;
+    while (std.mem.startsWith(u8, name, "-")) name = name[1..];
+    if (name.len == 0) return;
+    try buf.appendSlice(allocator, name);
+    try buf.append(allocator, '\n');
+}
+
+pub fn appendCurlConfigValue(buf: *std.ArrayListUnmanaged(u8), allocator: Allocator, key: []const u8, value: []const u8) !void {
+    var name = key;
+    while (std.mem.startsWith(u8, name, "-")) name = name[1..];
+    if (name.len == 0) return;
+
+    try buf.appendSlice(allocator, name);
+    try buf.appendSlice(allocator, " = \"");
+    for (value) |ch| {
+        switch (ch) {
+            '\\' => try buf.appendSlice(allocator, "\\\\"),
+            '"' => try buf.appendSlice(allocator, "\\\""),
+            '\n' => try buf.appendSlice(allocator, "\\n"),
+            '\r' => try buf.appendSlice(allocator, "\\r"),
+            '\t' => try buf.appendSlice(allocator, "\\t"),
+            else => try buf.append(allocator, ch),
+        }
+    }
+    try buf.appendSlice(allocator, "\"\n");
+}
+
+pub fn writeCurlConfigFile(allocator: Allocator, config: []const u8) ![]u8 {
+    const path = try std.fmt.allocPrint(
+        allocator,
+        "/tmp/nullclaw-curl-{d}-{x}.conf",
+        .{ std_compat.time.nanoTimestamp(), std_compat.crypto.random.int(u64) },
+    );
+    errdefer allocator.free(path);
+
+    var file = try std_compat.fs.createFileAbsolute(path, .{
+        .permissions = std_compat.fs.permissionsFromMode(0o600),
+    });
+    errdefer {
+        file.close();
+        std_compat.fs.deleteFileAbsolute(path) catch {};
+    }
+    try file.writeAll(config);
+    file.close();
+    return path;
+}
+
 /// HTTP POST via curl subprocess with optional proxy and timeout.
 ///
 /// `headers` is a slice of header strings (e.g. `"Authorization: Bearer xxx"`).
@@ -345,53 +393,32 @@ fn curlRequestWithProxy(
     max_time: ?[]const u8,
     resolve_entry: ?[]const u8,
 ) ![]u8 {
-    var argv_buf: [40][]const u8 = undefined;
+    var config: std.ArrayListUnmanaged(u8) = .empty;
+    defer config.deinit(allocator);
+    try appendCurlConfigFlag(&config, allocator, "silent");
+    try appendCurlConfigValue(&config, allocator, "request", method);
+    try appendCurlConfigValue(&config, allocator, "header", content_type_header);
+    if (proxy) |p| try appendCurlConfigValue(&config, allocator, "proxy", p);
+    if (resolve_entry) |entry| try appendCurlConfigValue(&config, allocator, "resolve", entry);
+    if (max_time) |mt| try appendCurlConfigValue(&config, allocator, "max-time", mt);
+    for (headers) |hdr| try appendCurlConfigValue(&config, allocator, "header", hdr);
+    try appendCurlConfigValue(&config, allocator, "data-binary", "@-");
+    try appendCurlConfigValue(&config, allocator, "url", url);
+
+    const config_path = try writeCurlConfigFile(allocator, config.items);
+    defer {
+        std_compat.fs.deleteFileAbsolute(config_path) catch {};
+        allocator.free(config_path);
+    }
+
+    var argv_buf: [3][]const u8 = undefined;
     var argc: usize = 0;
 
     argv_buf[argc] = "curl";
     argc += 1;
-    argv_buf[argc] = "-s";
+    argv_buf[argc] = "--config";
     argc += 1;
-    argv_buf[argc] = "-X";
-    argc += 1;
-    argv_buf[argc] = method;
-    argc += 1;
-    argv_buf[argc] = "-H";
-    argc += 1;
-    argv_buf[argc] = content_type_header;
-    argc += 1;
-
-    if (proxy) |p| {
-        argv_buf[argc] = "--proxy";
-        argc += 1;
-        argv_buf[argc] = p;
-        argc += 1;
-    }
-
-    appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
-
-    if (max_time) |mt| {
-        argv_buf[argc] = "--max-time";
-        argc += 1;
-        argv_buf[argc] = mt;
-        argc += 1;
-    }
-
-    for (headers) |hdr| {
-        if (argc + 2 > argv_buf.len) break;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = hdr;
-        argc += 1;
-    }
-
-    // Pass payload via stdin to avoid OS argv length limits for large JSON
-    // bodies (e.g. multimodal base64 images).
-    argv_buf[argc] = "--data-binary";
-    argc += 1;
-    argv_buf[argc] = "@-";
-    argc += 1;
-    argv_buf[argc] = url;
+    argv_buf[argc] = config_path;
     argc += 1;
 
     var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
@@ -514,49 +541,32 @@ pub fn curlPostWithStatusAndTimeoutAndResolve(
     max_time: ?[]const u8,
     resolve_entry: ?[]const u8,
 ) !HttpResponse {
-    var argv_buf: [48][]const u8 = undefined;
+    var config: std.ArrayListUnmanaged(u8) = .empty;
+    defer config.deinit(allocator);
+    try appendCurlConfigFlag(&config, allocator, "silent");
+    if (max_time) |mt| try appendCurlConfigValue(&config, allocator, "max-time", mt);
+    if (resolve_entry) |entry| try appendCurlConfigValue(&config, allocator, "resolve", entry);
+    try appendCurlConfigValue(&config, allocator, "request", "POST");
+    try appendCurlConfigValue(&config, allocator, "header", "Content-Type: application/json");
+    for (headers) |hdr| try appendCurlConfigValue(&config, allocator, "header", hdr);
+    try appendCurlConfigValue(&config, allocator, "data-binary", "@-");
+    try appendCurlConfigValue(&config, allocator, "write-out", "\n%{http_code}");
+    try appendCurlConfigValue(&config, allocator, "url", url);
+
+    const config_path = try writeCurlConfigFile(allocator, config.items);
+    defer {
+        std_compat.fs.deleteFileAbsolute(config_path) catch {};
+        allocator.free(config_path);
+    }
+
+    var argv_buf: [3][]const u8 = undefined;
     var argc: usize = 0;
 
     argv_buf[argc] = "curl";
     argc += 1;
-    argv_buf[argc] = "-s";
+    argv_buf[argc] = "--config";
     argc += 1;
-
-    if (max_time) |mt| {
-        argv_buf[argc] = "--max-time";
-        argc += 1;
-        argv_buf[argc] = mt;
-        argc += 1;
-    }
-
-    appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
-
-    argv_buf[argc] = "-X";
-    argc += 1;
-    argv_buf[argc] = "POST";
-    argc += 1;
-    argv_buf[argc] = "-H";
-    argc += 1;
-    argv_buf[argc] = "Content-Type: application/json";
-    argc += 1;
-
-    for (headers) |hdr| {
-        if (argc + 2 > argv_buf.len) break;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = hdr;
-        argc += 1;
-    }
-
-    argv_buf[argc] = "--data-binary";
-    argc += 1;
-    argv_buf[argc] = "@-";
-    argc += 1;
-    argv_buf[argc] = "-w";
-    argc += 1;
-    argv_buf[argc] = "\n%{http_code}";
-    argc += 1;
-    argv_buf[argc] = url;
+    argv_buf[argc] = config_path;
     argc += 1;
 
     var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
@@ -654,55 +664,33 @@ pub fn curlPostWithStatusHeadersAndTimeoutAndResolve(
     max_time: ?[]const u8,
     resolve_entry: ?[]const u8,
 ) !HttpResponseWithHeaders {
-    var argv_buf: [56][]const u8 = undefined;
+    var config: std.ArrayListUnmanaged(u8) = .empty;
+    defer config.deinit(allocator);
+    try appendCurlConfigFlag(&config, allocator, "silent");
+    if (max_time) |mt| try appendCurlConfigValue(&config, allocator, "max-time", mt);
+    if (resolve_entry) |entry| try appendCurlConfigValue(&config, allocator, "resolve", entry);
+    try appendCurlConfigValue(&config, allocator, "request", "POST");
+    try appendCurlConfigValue(&config, allocator, "header", "Content-Type: application/json");
+    for (headers) |hdr| try appendCurlConfigValue(&config, allocator, "header", hdr);
+    try appendCurlConfigValue(&config, allocator, "dump-header", "-");
+    try appendCurlConfigValue(&config, allocator, "data-binary", "@-");
+    try appendCurlConfigValue(&config, allocator, "write-out", "\n%{http_code}");
+    try appendCurlConfigValue(&config, allocator, "url", url);
+
+    const config_path = try writeCurlConfigFile(allocator, config.items);
+    defer {
+        std_compat.fs.deleteFileAbsolute(config_path) catch {};
+        allocator.free(config_path);
+    }
+
+    var argv_buf: [3][]const u8 = undefined;
     var argc: usize = 0;
 
     argv_buf[argc] = "curl";
     argc += 1;
-    argv_buf[argc] = "-s";
+    argv_buf[argc] = "--config";
     argc += 1;
-
-    if (max_time) |mt| {
-        argv_buf[argc] = "--max-time";
-        argc += 1;
-        argv_buf[argc] = mt;
-        argc += 1;
-    }
-
-    appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
-
-    argv_buf[argc] = "-X";
-    argc += 1;
-    argv_buf[argc] = "POST";
-    argc += 1;
-    argv_buf[argc] = "-H";
-    argc += 1;
-    argv_buf[argc] = "Content-Type: application/json";
-    argc += 1;
-
-    for (headers) |hdr| {
-        if (argc + 2 > argv_buf.len) break;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = hdr;
-        argc += 1;
-    }
-
-    // Dump response headers to stdout so we can capture session IDs.
-    argv_buf[argc] = "-D";
-    argc += 1;
-    argv_buf[argc] = "-";
-    argc += 1;
-
-    argv_buf[argc] = "--data-binary";
-    argc += 1;
-    argv_buf[argc] = "@-";
-    argc += 1;
-    argv_buf[argc] = "-w";
-    argc += 1;
-    argv_buf[argc] = "\n%{http_code}";
-    argc += 1;
-    argv_buf[argc] = url;
+    argv_buf[argc] = config_path;
     argc += 1;
 
     var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
@@ -814,36 +802,29 @@ pub fn curlGetWithStatusAndTimeoutAndResolve(
     max_time: ?[]const u8,
     resolve_entry: ?[]const u8,
 ) !HttpResponse {
-    var argv_buf: [48][]const u8 = undefined;
+    var config: std.ArrayListUnmanaged(u8) = .empty;
+    defer config.deinit(allocator);
+    try appendCurlConfigFlag(&config, allocator, "silent");
+    if (max_time) |mt| try appendCurlConfigValue(&config, allocator, "max-time", mt);
+    if (resolve_entry) |entry| try appendCurlConfigValue(&config, allocator, "resolve", entry);
+    for (headers) |hdr| try appendCurlConfigValue(&config, allocator, "header", hdr);
+    try appendCurlConfigValue(&config, allocator, "write-out", "\n%{http_code}");
+    try appendCurlConfigValue(&config, allocator, "url", url);
+
+    const config_path = try writeCurlConfigFile(allocator, config.items);
+    defer {
+        std_compat.fs.deleteFileAbsolute(config_path) catch {};
+        allocator.free(config_path);
+    }
+
+    var argv_buf: [3][]const u8 = undefined;
     var argc: usize = 0;
 
     argv_buf[argc] = "curl";
     argc += 1;
-    argv_buf[argc] = "-s";
+    argv_buf[argc] = "--config";
     argc += 1;
-
-    if (max_time) |mt| {
-        argv_buf[argc] = "--max-time";
-        argc += 1;
-        argv_buf[argc] = mt;
-        argc += 1;
-    }
-
-    appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
-
-    for (headers) |hdr| {
-        if (argc + 2 > argv_buf.len) break;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = hdr;
-        argc += 1;
-    }
-
-    argv_buf[argc] = "-w";
-    argc += 1;
-    argv_buf[argc] = "\n%{http_code}";
-    argc += 1;
-    argv_buf[argc] = url;
+    argv_buf[argc] = config_path;
     argc += 1;
 
     var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
@@ -931,41 +912,30 @@ fn curlGetWithProxyAndResolve(
     resolve_entry: ?[]const u8,
     max_bytes: usize,
 ) ![]u8 {
-    var argv_buf: [48][]const u8 = undefined;
+    var config: std.ArrayListUnmanaged(u8) = .empty;
+    defer config.deinit(allocator);
+    try appendCurlConfigFlag(&config, allocator, "silent");
+    try appendCurlConfigFlag(&config, allocator, "fail");
+    try appendCurlConfigValue(&config, allocator, "max-time", timeout_secs);
+    if (proxy) |p| try appendCurlConfigValue(&config, allocator, "proxy", p);
+    if (resolve_entry) |entry| try appendCurlConfigValue(&config, allocator, "resolve", entry);
+    for (headers) |hdr| try appendCurlConfigValue(&config, allocator, "header", hdr);
+    try appendCurlConfigValue(&config, allocator, "url", url);
+
+    const config_path = try writeCurlConfigFile(allocator, config.items);
+    defer {
+        std_compat.fs.deleteFileAbsolute(config_path) catch {};
+        allocator.free(config_path);
+    }
+
+    var argv_buf: [3][]const u8 = undefined;
     var argc: usize = 0;
 
     argv_buf[argc] = "curl";
     argc += 1;
-    argv_buf[argc] = "-sf";
+    argv_buf[argc] = "--config";
     argc += 1;
-    argv_buf[argc] = "--max-time";
-    argc += 1;
-    argv_buf[argc] = timeout_secs;
-    argc += 1;
-
-    if (proxy) |p| {
-        argv_buf[argc] = "--proxy";
-        argc += 1;
-        argv_buf[argc] = p;
-        argc += 1;
-    }
-
-    if (resolve_entry) |entry| {
-        argv_buf[argc] = "--resolve";
-        argc += 1;
-        argv_buf[argc] = entry;
-        argc += 1;
-    }
-
-    for (headers) |hdr| {
-        if (argc + 2 > argv_buf.len) break;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = hdr;
-        argc += 1;
-    }
-
-    argv_buf[argc] = url;
+    argv_buf[argc] = config_path;
     argc += 1;
 
     var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);

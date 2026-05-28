@@ -418,69 +418,42 @@ pub fn curlStream(
     const log_enabled = verbose.isVerbose();
     const debug_log = std.log.scoped(.sse);
 
-    // Build argv on stack (max 40 args)
-    var argv_buf: [40][]const u8 = undefined;
-    var argc: usize = 0;
-
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "-s";
-    argc += 1;
-    argv_buf[argc] = "--no-buffer";
-    argc += 1;
-    argv_buf[argc] = curlFailFastArg(allocator);
-    argc += 1;
+    var config: std.ArrayListUnmanaged(u8) = .empty;
+    defer config.deinit(allocator);
+    try http_util.appendCurlConfigFlag(&config, allocator, "silent");
+    try http_util.appendCurlConfigFlag(&config, allocator, "no-buffer");
+    try http_util.appendCurlConfigFlag(&config, allocator, curlFailFastArg(allocator));
 
     var timeout_buf: [32]u8 = undefined;
     if (timeout_secs > 0) {
         const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs}) catch unreachable;
-        argv_buf[argc] = "--max-time";
-        argc += 1;
-        argv_buf[argc] = timeout_str;
-        argc += 1;
+        try http_util.appendCurlConfigValue(&config, allocator, "max-time", timeout_str);
     }
 
     // Kill the curl process if transfer rate drops below 1 byte/second for 60 seconds.
     // This catches providers that open the SSE connection but stall mid-stream without
     // hitting the --max-time wall (e.g. glm-5 on infini-ai hanging on large contexts).
-    appendCurlStallDetectionArgs(argv_buf[0..], &argc);
-
-    argv_buf[argc] = "-X";
-    argc += 1;
-    argv_buf[argc] = "POST";
-    argc += 1;
-    argv_buf[argc] = "-H";
-    argc += 1;
-    argv_buf[argc] = "Content-Type: application/json";
-    argc += 1;
+    try http_util.appendCurlConfigValue(&config, allocator, "speed-limit", "1");
+    try http_util.appendCurlConfigValue(&config, allocator, "speed-time", "60");
+    try http_util.appendCurlConfigValue(&config, allocator, "request", "POST");
+    try http_util.appendCurlConfigValue(&config, allocator, "header", "Content-Type: application/json");
 
     // Add proxy from environment if set
     const proxy = http_util.getProxyFromEnv(allocator) catch null;
     defer if (proxy) |p| allocator.free(p);
 
-    if (proxy) |p| {
-        argv_buf[argc] = "--proxy";
-        argc += 1;
-        argv_buf[argc] = p;
-        argc += 1;
-    }
+    if (proxy) |p| try http_util.appendCurlConfigValue(&config, allocator, "proxy", p);
 
     const resolve_entry = try http_util.buildSafeResolveEntryForRemoteUrl(allocator, url);
     defer if (resolve_entry) |entry| allocator.free(entry);
-    http_util.appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
+    if (resolve_entry) |entry| try http_util.appendCurlConfigValue(&config, allocator, "resolve", entry);
 
     if (auth_header) |auth| {
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = auth;
-        argc += 1;
+        try http_util.appendCurlConfigValue(&config, allocator, "header", auth);
     }
 
     for (extra_headers) |hdr| {
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = hdr;
-        argc += 1;
+        try http_util.appendCurlConfigValue(&config, allocator, "header", hdr);
     }
 
     // On Windows, command line length is limited to ~32767 chars.
@@ -489,15 +462,26 @@ pub fn curlStream(
     defer prepared_body.deinit(allocator);
 
     if (prepared_body.uses_temp_file) {
-        argv_buf[argc] = "--data-binary";
-        argc += 1;
+        try http_util.appendCurlConfigValue(&config, allocator, "data-binary", prepared_body.arg);
     } else {
-        argv_buf[argc] = "-d";
-        argc += 1;
+        try http_util.appendCurlConfigValue(&config, allocator, "data", prepared_body.arg);
     }
-    argv_buf[argc] = prepared_body.arg;
+    try http_util.appendCurlConfigValue(&config, allocator, "url", url);
+
+    const config_path = try http_util.writeCurlConfigFile(allocator, config.items);
+    defer {
+        std_compat.fs.deleteFileAbsolute(config_path) catch {};
+        allocator.free(config_path);
+    }
+
+    var argv_buf: [3][]const u8 = undefined;
+    var argc: usize = 0;
+
+    argv_buf[argc] = "curl";
     argc += 1;
-    argv_buf[argc] = url;
+    argv_buf[argc] = "--config";
+    argc += 1;
+    argv_buf[argc] = config_path;
     argc += 1;
 
     // Debug: log the curl command
@@ -813,45 +797,25 @@ pub fn curlStreamAnthropic(
     callback: root.StreamCallback,
     ctx: *anyopaque,
 ) !root.StreamChatResult {
-    // Build argv on stack (max 40 args)
-    var argv_buf: [40][]const u8 = undefined;
-    var argc: usize = 0;
-
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "-s";
-    argc += 1;
-    argv_buf[argc] = "--no-buffer";
-    argc += 1;
-    argv_buf[argc] = "-X";
-    argc += 1;
-    argv_buf[argc] = "POST";
-    argc += 1;
-    argv_buf[argc] = "-H";
-    argc += 1;
-    argv_buf[argc] = "Content-Type: application/json";
-    argc += 1;
+    var config: std.ArrayListUnmanaged(u8) = .empty;
+    defer config.deinit(allocator);
+    try http_util.appendCurlConfigFlag(&config, allocator, "silent");
+    try http_util.appendCurlConfigFlag(&config, allocator, "no-buffer");
+    try http_util.appendCurlConfigValue(&config, allocator, "request", "POST");
+    try http_util.appendCurlConfigValue(&config, allocator, "header", "Content-Type: application/json");
 
     // Add proxy from environment if set
     const proxy = http_util.getProxyFromEnv(allocator) catch null;
     defer if (proxy) |p| allocator.free(p);
 
-    if (proxy) |p| {
-        argv_buf[argc] = "--proxy";
-        argc += 1;
-        argv_buf[argc] = p;
-        argc += 1;
-    }
+    if (proxy) |p| try http_util.appendCurlConfigValue(&config, allocator, "proxy", p);
 
     const resolve_entry = try http_util.buildSafeResolveEntryForRemoteUrl(allocator, url);
     defer if (resolve_entry) |entry| allocator.free(entry);
-    http_util.appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
+    if (resolve_entry) |entry| try http_util.appendCurlConfigValue(&config, allocator, "resolve", entry);
 
     for (headers) |hdr| {
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = hdr;
-        argc += 1;
+        try http_util.appendCurlConfigValue(&config, allocator, "header", hdr);
     }
 
     const log_enabled = verbose.isVerbose();
@@ -859,14 +823,26 @@ pub fn curlStreamAnthropic(
     defer prepared_body.deinit(allocator);
 
     if (prepared_body.uses_temp_file) {
-        argv_buf[argc] = "--data-binary";
+        try http_util.appendCurlConfigValue(&config, allocator, "data-binary", prepared_body.arg);
     } else {
-        argv_buf[argc] = "-d";
+        try http_util.appendCurlConfigValue(&config, allocator, "data", prepared_body.arg);
     }
+    try http_util.appendCurlConfigValue(&config, allocator, "url", url);
+
+    const config_path = try http_util.writeCurlConfigFile(allocator, config.items);
+    defer {
+        std_compat.fs.deleteFileAbsolute(config_path) catch {};
+        allocator.free(config_path);
+    }
+
+    var argv_buf: [3][]const u8 = undefined;
+    var argc: usize = 0;
+
+    argv_buf[argc] = "curl";
     argc += 1;
-    argv_buf[argc] = prepared_body.arg;
+    argv_buf[argc] = "--config";
     argc += 1;
-    argv_buf[argc] = url;
+    argv_buf[argc] = config_path;
     argc += 1;
 
     var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);

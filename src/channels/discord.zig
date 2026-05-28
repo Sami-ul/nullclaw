@@ -548,41 +548,34 @@ pub const DiscordChannel = struct {
     }
 
     fn sendJsonMethod(self: *DiscordChannel, method: []const u8, url: []const u8, body: []const u8) !void {
-        var argv_buf: [16][]const u8 = undefined;
-        var argc: usize = 0;
-        argv_buf[argc] = "curl";
-        argc += 1;
-        argv_buf[argc] = "-s";
-        argc += 1;
-        argv_buf[argc] = "-X";
-        argc += 1;
-        argv_buf[argc] = method;
-        argc += 1;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = "Content-Type: application/json";
-        argc += 1;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = DISCORD_USER_AGENT_HEADER;
-        argc += 1;
+        var config: std.ArrayListUnmanaged(u8) = .empty;
+        defer config.deinit(self.allocator);
+        try root.http_util.appendCurlConfigFlag(&config, self.allocator, "silent");
+        try root.http_util.appendCurlConfigValue(&config, self.allocator, "request", method);
+        try root.http_util.appendCurlConfigValue(&config, self.allocator, "header", "Content-Type: application/json");
+        try root.http_util.appendCurlConfigValue(&config, self.allocator, "header", DISCORD_USER_AGENT_HEADER);
 
         var auth_buf: [512]u8 = undefined;
         var auth_writer: std.Io.Writer = .fixed(&auth_buf);
         try auth_writer.print("Authorization: Bot {s}", .{self.token});
-        argv_buf[argc] = "-H";
+        try root.http_util.appendCurlConfigValue(&config, self.allocator, "header", auth_writer.buffered());
+        try root.http_util.appendCurlConfigValue(&config, self.allocator, "data-binary", "@-");
+        try root.http_util.appendCurlConfigValue(&config, self.allocator, "write-out", "\n%{http_code}");
+        try root.http_util.appendCurlConfigValue(&config, self.allocator, "url", url);
+
+        const config_path = try root.http_util.writeCurlConfigFile(self.allocator, config.items);
+        defer {
+            std_compat.fs.deleteFileAbsolute(config_path) catch {};
+            self.allocator.free(config_path);
+        }
+
+        var argv_buf: [3][]const u8 = undefined;
+        var argc: usize = 0;
+        argv_buf[argc] = "curl";
         argc += 1;
-        argv_buf[argc] = auth_writer.buffered();
+        argv_buf[argc] = "--config";
         argc += 1;
-        argv_buf[argc] = "--data-binary";
-        argc += 1;
-        argv_buf[argc] = "@-";
-        argc += 1;
-        argv_buf[argc] = "-w";
-        argc += 1;
-        argv_buf[argc] = "\n%{http_code}";
-        argc += 1;
-        argv_buf[argc] = url;
+        argv_buf[argc] = config_path;
         argc += 1;
 
         var child = std_compat.process.Child.init(argv_buf[0..argc], self.allocator);

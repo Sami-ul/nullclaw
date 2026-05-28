@@ -288,55 +288,43 @@ pub const Client = struct {
         try chatid_writer.print("chat_id={s}", .{chat_id});
         const chatid_arg = chatid_writer.buffered();
 
-        var argv_buf: [24][]const u8 = undefined;
-        var argc: usize = 0;
-        argv_buf[argc] = "curl";
-        argc += 1;
-        argv_buf[argc] = "-s";
-        argc += 1;
-        argv_buf[argc] = "-m";
-        argc += 1;
-        argv_buf[argc] = "120";
-        argc += 1;
-
-        if (self.proxy) |p| {
-            argv_buf[argc] = "-x";
-            argc += 1;
-            argv_buf[argc] = p;
-            argc += 1;
-        }
-
-        argv_buf[argc] = "-F";
-        argc += 1;
-        argv_buf[argc] = chatid_arg;
-        argc += 1;
+        var config: std.ArrayListUnmanaged(u8) = .empty;
+        defer config.deinit(allocator);
+        try root.http_util.appendCurlConfigFlag(&config, allocator, "silent");
+        try root.http_util.appendCurlConfigValue(&config, allocator, "max-time", "120");
+        if (self.proxy) |p| try root.http_util.appendCurlConfigValue(&config, allocator, "proxy", p);
+        try root.http_util.appendCurlConfigValue(&config, allocator, "form", chatid_arg);
 
         var thread_arg_buf: [128]u8 = undefined;
         if (message_thread_id) |thread_id| {
             var thread_writer: std.Io.Writer = .fixed(&thread_arg_buf);
             try thread_writer.print("message_thread_id={d}", .{thread_id});
-            argv_buf[argc] = "-F";
-            argc += 1;
-            argv_buf[argc] = thread_writer.buffered();
-            argc += 1;
+            try root.http_util.appendCurlConfigValue(&config, allocator, "form", thread_writer.buffered());
         }
 
-        argv_buf[argc] = "-F";
-        argc += 1;
-        argv_buf[argc] = file_arg;
-        argc += 1;
+        try root.http_util.appendCurlConfigValue(&config, allocator, "form", file_arg);
 
         var caption_arg_buf: [1024]u8 = undefined;
         if (caption) |cap| {
             var caption_writer: std.Io.Writer = .fixed(&caption_arg_buf);
             try caption_writer.print("caption={s}", .{cap});
-            argv_buf[argc] = "-F";
-            argc += 1;
-            argv_buf[argc] = caption_writer.buffered();
-            argc += 1;
+            try root.http_util.appendCurlConfigValue(&config, allocator, "form", caption_writer.buffered());
+        }
+        try root.http_util.appendCurlConfigValue(&config, allocator, "url", url);
+
+        const config_path = try root.http_util.writeCurlConfigFile(allocator, config.items);
+        defer {
+            std_compat.fs.deleteFileAbsolute(config_path) catch {};
+            allocator.free(config_path);
         }
 
-        argv_buf[argc] = url;
+        var argv_buf: [3][]const u8 = undefined;
+        var argc: usize = 0;
+        argv_buf[argc] = "curl";
+        argc += 1;
+        argv_buf[argc] = "--config";
+        argc += 1;
+        argv_buf[argc] = config_path;
         argc += 1;
 
         var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);

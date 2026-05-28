@@ -270,31 +270,28 @@ fn curlPostFromFile(
     try data_writer.print("@{s}", .{file_path});
     const data_arg = data_writer.buffered();
 
-    var argv_buf: [32][]const u8 = undefined;
+    var config: std.ArrayListUnmanaged(u8) = .empty;
+    defer config.deinit(allocator);
+    try http_util.appendCurlConfigFlag(&config, allocator, "silent");
+    try http_util.appendCurlConfigValue(&config, allocator, "request", "POST");
+    for (headers) |hdr| try http_util.appendCurlConfigValue(&config, allocator, "header", hdr);
+    try http_util.appendCurlConfigValue(&config, allocator, "data-binary", data_arg);
+    try http_util.appendCurlConfigValue(&config, allocator, "url", url);
+
+    const config_path = try http_util.writeCurlConfigFile(allocator, config.items);
+    defer {
+        std_compat.fs.deleteFileAbsolute(config_path) catch {};
+        allocator.free(config_path);
+    }
+
+    var argv_buf: [3][]const u8 = undefined;
     var argc: usize = 0;
 
     argv_buf[argc] = "curl";
     argc += 1;
-    argv_buf[argc] = "-s";
+    argv_buf[argc] = "--config";
     argc += 1;
-    argv_buf[argc] = "-X";
-    argc += 1;
-    argv_buf[argc] = "POST";
-    argc += 1;
-
-    for (headers) |hdr| {
-        if (argc + 2 > argv_buf.len) break;
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = hdr;
-        argc += 1;
-    }
-
-    argv_buf[argc] = "--data-binary";
-    argc += 1;
-    argv_buf[argc] = data_arg;
-    argc += 1;
-    argv_buf[argc] = url;
+    argv_buf[argc] = config_path;
     argc += 1;
 
     var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);

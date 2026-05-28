@@ -374,78 +374,51 @@ fn codexStreamRequest(
     callback: root.StreamCallback,
     ctx: *anyopaque,
 ) !StreamChatResult {
-    // Build argv on stack
-    var argv_buf: [40][]const u8 = undefined;
-    var argc: usize = 0;
-
-    argv_buf[argc] = "curl";
-    argc += 1;
-    argv_buf[argc] = "-s";
-    argc += 1;
-    argv_buf[argc] = "--no-buffer";
-    argc += 1;
-    argv_buf[argc] = "--connect-timeout";
-    argc += 1;
-    argv_buf[argc] = CODEX_CONNECT_TIMEOUT_SECS;
-    argc += 1;
-    argv_buf[argc] = "-X";
-    argc += 1;
-    argv_buf[argc] = "POST";
-    argc += 1;
-    argv_buf[argc] = "-H";
-    argc += 1;
-    argv_buf[argc] = "Content-Type: application/json";
-    argc += 1;
-    argv_buf[argc] = "-H";
-    argc += 1;
-    argv_buf[argc] = auth_header;
-    argc += 1;
+    var config: std.ArrayListUnmanaged(u8) = .empty;
+    defer config.deinit(allocator);
+    try http_util.appendCurlConfigFlag(&config, allocator, "silent");
+    try http_util.appendCurlConfigFlag(&config, allocator, "no-buffer");
+    try http_util.appendCurlConfigValue(&config, allocator, "connect-timeout", CODEX_CONNECT_TIMEOUT_SECS);
+    try http_util.appendCurlConfigValue(&config, allocator, "request", "POST");
+    try http_util.appendCurlConfigValue(&config, allocator, "header", "Content-Type: application/json");
+    try http_util.appendCurlConfigValue(&config, allocator, "header", auth_header);
 
     // Add proxy from environment if set
     const proxy = http_util.getProxyFromEnv(allocator) catch null;
     defer if (proxy) |p| allocator.free(p);
-
-    if (proxy) |p| {
-        argv_buf[argc] = "--proxy";
-        argc += 1;
-        argv_buf[argc] = p;
-        argc += 1;
-    }
+    if (proxy) |p| try http_util.appendCurlConfigValue(&config, allocator, "proxy", p);
 
     var timeout_buf: [32]u8 = undefined;
     if (timeout_secs > 0) {
-        argv_buf[argc] = "--max-time";
-        argc += 1;
-        argv_buf[argc] = try std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs});
-        argc += 1;
+        try http_util.appendCurlConfigValue(&config, allocator, "max-time", try std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs}));
     }
 
     var speed_time_buf: [32]u8 = undefined;
-    argv_buf[argc] = "--speed-limit";
-    argc += 1;
-    argv_buf[argc] = "1";
-    argc += 1;
-    argv_buf[argc] = "--speed-time";
-    argc += 1;
-    argv_buf[argc] = try std.fmt.bufPrint(&speed_time_buf, "{d}", .{effectiveCodexStallTimeoutSecs(timeout_secs)});
-    argc += 1;
+    try http_util.appendCurlConfigValue(&config, allocator, "speed-limit", "1");
+    try http_util.appendCurlConfigValue(&config, allocator, "speed-time", try std.fmt.bufPrint(&speed_time_buf, "{d}", .{effectiveCodexStallTimeoutSecs(timeout_secs)}));
 
     const resolve_entry = try http_util.buildSafeResolveEntryForRemoteUrl(allocator, url);
     defer if (resolve_entry) |entry| allocator.free(entry);
-    http_util.appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
+    if (resolve_entry) |entry| try http_util.appendCurlConfigValue(&config, allocator, "resolve", entry);
 
-    for (extra_headers) |hdr| {
-        argv_buf[argc] = "-H";
-        argc += 1;
-        argv_buf[argc] = hdr;
-        argc += 1;
+    for (extra_headers) |hdr| try http_util.appendCurlConfigValue(&config, allocator, "header", hdr);
+    try http_util.appendCurlConfigValue(&config, allocator, "data-binary", "@-");
+    try http_util.appendCurlConfigValue(&config, allocator, "url", url);
+
+    const config_path = try http_util.writeCurlConfigFile(allocator, config.items);
+    defer {
+        std_compat.fs.deleteFileAbsolute(config_path) catch {};
+        allocator.free(config_path);
     }
 
-    argv_buf[argc] = "--data-binary";
+    var argv_buf: [3][]const u8 = undefined;
+    var argc: usize = 0;
+
+    argv_buf[argc] = "curl";
     argc += 1;
-    argv_buf[argc] = "@-";
+    argv_buf[argc] = "--config";
     argc += 1;
-    argv_buf[argc] = url;
+    argv_buf[argc] = config_path;
     argc += 1;
 
     var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
