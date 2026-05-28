@@ -1983,13 +1983,13 @@ pub const SessionManager = struct {
     };
 
     /// Return the routing input for a session without acquiring the long turn mutex.
-    /// If the session does not exist yet, returns defaults (process, off, false).
+    /// If the session does not exist yet, returns defaults (process, serial, false).
     pub fn routeInput(self: *SessionManager, session_key: []const u8) inbound_router.RouteInput {
         self.mutex.lock();
         defer self.mutex.unlock();
         const session = self.sessions.get(session_key) orelse return .{
             .turn_running = false,
-            .queue_mode = .off,
+            .queue_mode = .serial,
             .has_pending_injection = false,
         };
         return .{
@@ -2045,8 +2045,8 @@ pub const SessionManager = struct {
             },
             .drop => blk: {
                 if (!self.isSessionTurnRunning(session_key)) break :blk .process;
-                log.info("dropping message: session busy queue_mode=off session=0x{x}", .{session_hash});
-                break :blk .skip;
+                log.warn("queue_mode=off would drop busy message; serializing instead session=0x{x}", .{session_hash});
+                break :blk .process;
             },
             .process, .queue => .process,
         };
@@ -4031,7 +4031,7 @@ test "routeInbound handles active session routing side effects" {
 
     session.agent.queue_mode = .off;
     try testing.expectEqual(
-        SessionManager.InboundRouteAction.skip,
+        SessionManager.InboundRouteAction.process,
         sm.routeInbound(session_key, "drop message"),
     );
     try testing.expect(!sm.routeInput(session_key).has_pending_injection);

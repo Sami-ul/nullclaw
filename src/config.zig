@@ -2637,6 +2637,7 @@ test "save roundtrip preserves extended config sections" {
     cfg.scheduler.max_concurrent = 2;
     cfg.scheduler.agent_timeout_secs = 123;
     cfg.messages.inbound.debounce_ms = 1500;
+    cfg.messages.inbound.queue_mode = "latest";
 
     cfg.agent.compact_context = true;
     cfg.agent.max_tool_iterations = 7;
@@ -2783,6 +2784,7 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expectEqual(@as(u32, 32), loaded.scheduler.max_tasks);
     try std.testing.expectEqual(@as(u64, 123), loaded.scheduler.agent_timeout_secs);
     try std.testing.expectEqual(@as(u32, 1500), loaded.messages.inbound.debounce_ms);
+    try std.testing.expectEqualStrings("latest", loaded.messages.inbound.queue_mode);
     try std.testing.expect(loaded.agent.parallel_tools);
     try std.testing.expect(!loaded.agent.status_show_emojis);
     try std.testing.expectEqualStrings("UTC+08:00", loaded.agent.timezone);
@@ -3968,14 +3970,15 @@ test "json parse scheduler section" {
     try std.testing.expectEqual(@as(u64, 600), cfg.scheduler.agent_timeout_secs);
 }
 
-test "json parse messages section reads inbound debounce config" {
+test "json parse messages section reads inbound config" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"messages": {"inbound": {"debounce_ms": 1500}}}
+        \\{"messages": {"inbound": {"debounce_ms": 1500, "queue_mode": "latest"}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
     try std.testing.expectEqual(@as(u32, 1500), cfg.messages.inbound.debounce_ms);
+    try std.testing.expectEqualStrings("latest", cfg.messages.inbound.queue_mode);
 }
 
 test "json parse agent section" {

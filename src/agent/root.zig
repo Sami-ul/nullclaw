@@ -193,6 +193,14 @@ pub const Agent = struct {
                 .debounce => "debounce",
             };
         }
+
+        pub fn fromSlice(raw: []const u8) ?QueueMode {
+            if (std.ascii.eqlIgnoreCase(raw, "off")) return .off;
+            if (std.ascii.eqlIgnoreCase(raw, "serial")) return .serial;
+            if (std.ascii.eqlIgnoreCase(raw, "latest")) return .latest;
+            if (std.ascii.eqlIgnoreCase(raw, "debounce")) return .debounce;
+            return null;
+        }
     };
 
     const QueueDrop = enum {
@@ -327,7 +335,8 @@ pub const Agent = struct {
     exec_ask: ExecAsk = .on_miss,
     exec_node_id: ?[]const u8 = null,
     exec_node_id_owned: bool = false,
-    queue_mode: QueueMode = .off,
+    default_queue_mode: QueueMode = .serial,
+    queue_mode: QueueMode = .serial,
     queue_debounce_ms: u32 = 0,
     queue_cap: u32 = 0,
     queue_drop: QueueDrop = .summarize,
@@ -545,6 +554,7 @@ pub const Agent = struct {
             .full, .read_only, .yolo => .off,
             .supervised => .on_miss,
         };
+        const resolved_queue_mode = QueueMode.fromSlice(cfg.messages.inbound.queue_mode) orelse .serial;
 
         // Build tool specs for function-calling APIs
         const specs = try allocator.alloc(ToolSpec, tools.len);
@@ -643,6 +653,8 @@ pub const Agent = struct {
             .exec_security = resolved_exec_security,
             .default_exec_ask = resolved_exec_ask,
             .exec_ask = resolved_exec_ask,
+            .default_queue_mode = resolved_queue_mode,
+            .queue_mode = resolved_queue_mode,
             .history = .empty,
             .usage_mode = if (cfg.cost.enabled) .full else .off,
             .total_tokens = 0,

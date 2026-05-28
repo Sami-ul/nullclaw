@@ -327,6 +327,7 @@ pub const ReliabilityConfig = struct {
 
 pub const InboundMessagesConfig = struct {
     debounce_ms: u32 = 3_000,
+    queue_mode: []const u8 = "serial",
 };
 
 pub const MessagesConfig = struct {

@@ -2688,6 +2688,11 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             self.messages.inbound.debounce_ms = @intCast(v.integer);
                         }
                     }
+                    if (inbound.object.get("queue_mode")) |v| {
+                        if (v == .string) {
+                            self.messages.inbound.queue_mode = try self.allocator.dupe(u8, v.string);
+                        }
+                    }
                 }
             }
         }

@@ -3450,7 +3450,7 @@ fn resetRuntimeCommandState(self: anytype) void {
     if (self.exec_node_id_owned and self.exec_node_id != null) self.allocator.free(self.exec_node_id.?);
     self.exec_node_id = null;
     self.exec_node_id_owned = false;
-    self.queue_mode = .off;
+    self.queue_mode = self.default_queue_mode;
     self.queue_debounce_ms = 0;
     self.queue_cap = 0;
     self.queue_drop = .summarize;
@@ -3672,7 +3672,7 @@ fn handleQueueCommand(self: anytype, arg: []const u8) ![]const u8 {
     }
 
     if (std.ascii.eqlIgnoreCase(arg, "reset")) {
-        self.queue_mode = .off;
+        self.queue_mode = self.default_queue_mode;
         self.queue_debounce_ms = 0;
         self.queue_cap = 0;
         self.queue_drop = .summarize;

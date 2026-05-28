@@ -16,7 +16,7 @@ pub const MemoryRecallTool = struct {
     mem_rt: ?*mem_root.MemoryRuntime = null,
 
     pub const tool_name = "memory_recall";
-    pub const tool_description = "Search long-term memory for relevant facts, preferences, or context.";
+    pub const tool_description = "Search long-term memory for relevant durable facts, preferences, procedures, project state, or context. Raw autosaved transcript fragments are suppressed by default.";
     pub const tool_params =
         \\{"type":"object","properties":{"query":{"type":"string","description":"Keywords or phrase to search for in memory"},"limit":{"type":"integer","description":"Max results to return (default: 5)"},"session_id":{"type":"string","description":"Optional session scope. Omit to search the current session plus global memory; pass an empty string to search only the current thread session."}},"required":["query"]}
     ;
@@ -234,6 +234,7 @@ pub const MemoryRecallTool = struct {
         var count: usize = 0;
         for (entries) |entry| {
             if (mem_root.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) continue;
+            if (isNoisyAutosaveMemory(entry.category, entry.key)) continue;
             count += 1;
         }
         return count;
@@ -243,9 +244,17 @@ pub const MemoryRecallTool = struct {
         var count: usize = 0;
         for (candidates) |cand| {
             if (mem_root.isInternalMemoryEntryKeyOrContent(cand.key, cand.snippet)) continue;
+            if (isNoisyAutosaveMemory(cand.category, cand.key)) continue;
             count += 1;
         }
         return count;
+    }
+
+    fn isNoisyAutosaveMemory(category: mem_root.MemoryCategory, key: []const u8) bool {
+        return switch (category) {
+            .conversation => std.mem.startsWith(u8, key, "autosave_"),
+            else => false,
+        };
     }
 
     fn formatEntries(allocator: std.mem.Allocator, entries: []const MemoryEntry, visible_count: usize) !ToolResult {
@@ -262,6 +271,7 @@ pub const MemoryRecallTool = struct {
         for (entries, 0..) |entry, i| {
             _ = i;
             if (mem_root.isInternalMemoryEntryKeyOrContent(entry.key, entry.content)) continue;
+            if (isNoisyAutosaveMemory(entry.category, entry.key)) continue;
             var idx_buf: [20]u8 = undefined;
             shown_idx += 1;
             const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{shown_idx}) catch "?";
@@ -296,6 +306,7 @@ pub const MemoryRecallTool = struct {
         for (candidates, 0..) |cand, i| {
             _ = i;
             if (mem_root.isInternalMemoryEntryKeyOrContent(cand.key, cand.snippet)) continue;
+            if (isNoisyAutosaveMemory(cand.category, cand.key)) continue;
             var idx_buf: [20]u8 = undefined;
             shown_idx += 1;
             const idx_str = std.fmt.bufPrint(&idx_buf, "{d}", .{shown_idx}) catch "?";
