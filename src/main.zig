@@ -3259,6 +3259,7 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             std.debug.print("memory {s} failed: {s}\n", .{ subcmd, @errorName(err) });
             std_compat.process.exit(1);
         };
+        mem_rt.syncVectorAfterStore(allocator, key, content, session_id);
 
         const stored = mem_rt.memory.getScoped(allocator, key, session_id) catch |err| {
             if (json_mode) writeJsonError("memory_store_failed", @errorName(err), cfg.memory.backend);
