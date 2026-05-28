@@ -6698,7 +6698,7 @@ test "parse telegram accounts keeps single custom account id" {
 test "parse discord accounts" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"channels": {"discord": {"accounts": {"main": {"token": "disc-tok", "guild_id": "12345", "allow_from": ["u1"], "require_mention": true}}}}}
+        \\{"channels": {"discord": {"accounts": {"main": {"token": "disc-tok", "guild_id": "12345", "allow_from": ["u1"], "allowed_channels": ["c1"], "ignored_channels": ["c2"], "require_mention": true}}}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -6707,12 +6707,20 @@ test "parse discord accounts" {
     try std.testing.expectEqualStrings("main", dc.account_id);
     try std.testing.expectEqualStrings("disc-tok", dc.token);
     try std.testing.expectEqualStrings("12345", dc.guild_id.?);
+    try std.testing.expectEqual(@as(usize, 1), dc.allowed_channels.len);
+    try std.testing.expectEqualStrings("c1", dc.allowed_channels[0]);
+    try std.testing.expectEqual(@as(usize, 1), dc.ignored_channels.len);
+    try std.testing.expectEqualStrings("c2", dc.ignored_channels[0]);
     try std.testing.expect(dc.require_mention);
     allocator.free(dc.account_id);
     allocator.free(dc.token);
     allocator.free(dc.guild_id.?);
     for (dc.allow_from) |u| allocator.free(u);
     allocator.free(dc.allow_from);
+    for (dc.allowed_channels) |c| allocator.free(c);
+    allocator.free(dc.allowed_channels);
+    for (dc.ignored_channels) |c| allocator.free(c);
+    allocator.free(dc.ignored_channels);
     allocator.free(cfg.channels.discord);
 }
 

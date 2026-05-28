@@ -79,9 +79,9 @@ pub const MessageTool = struct {
 
         const result = std.fmt.allocPrint(
             allocator,
-            "Message sent to {s}:{s} ({d} chars)",
+            "Message queued to {s}:{s} ({d} chars)",
             .{ channel, chat_id, content.len },
-        ) catch return ToolResult.ok("Message sent");
+        ) catch return ToolResult.ok("Message queued");
 
         return ToolResult{ .success = true, .output = result };
     }

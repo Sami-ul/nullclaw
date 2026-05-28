@@ -901,7 +901,7 @@ pub const CronScheduler = struct {
                         job.last_output = null;
                         // Deliver error notification
                         if (out_bus) |b| {
-                            _ = deliverResult(self.allocator, job.delivery, "cron job failed to start", false, b) catch {};
+                            deliverCronResultChecked(self.allocator, job, "cron job failed to start", false, b);
                         }
                         continue;
                     };
@@ -923,7 +923,7 @@ pub const CronScheduler = struct {
 
                     if (out_bus) |b| {
                         const output = job.last_output orelse "";
-                        _ = deliverResult(self.allocator, job.delivery, output, success, b) catch {};
+                        deliverCronResultChecked(self.allocator, job, output, success, b);
                     }
                 },
                 .agent => {
@@ -938,9 +938,9 @@ pub const CronScheduler = struct {
 
                         if (out_bus) |b| {
                             if (job.session_target == .main) {
-                                _ = deliverViaMainAgent(self.allocator, job.delivery, agent_output, true, b, job.name orelse job.id) catch {};
+                                deliverCronMainAgentChecked(self.allocator, job, agent_output, true, b);
                             } else {
-                                _ = deliverResult(self.allocator, job.delivery, agent_output, true, b) catch {};
+                                deliverCronResultChecked(self.allocator, job, agent_output, true, b);
                             }
                         }
                     } else {
@@ -951,7 +951,7 @@ pub const CronScheduler = struct {
                             if (job.last_output) |old| self.allocator.free(old);
                             job.last_output = null;
                             if (out_bus) |b| {
-                                _ = deliverResult(self.allocator, job.delivery, "agent job execution failed", false, b) catch {};
+                                deliverCronResultChecked(self.allocator, job, "agent job execution failed", false, b);
                             }
                             continue;
                         };
@@ -961,9 +961,9 @@ pub const CronScheduler = struct {
                         if (job.last_output) |old| self.allocator.free(old);
                         if (out_bus) |b| {
                             if (job.session_target == .main) {
-                                _ = deliverViaMainAgent(self.allocator, job.delivery, exec_result.output, exec_result.success, b, job.name orelse job.id) catch {};
+                                deliverCronMainAgentChecked(self.allocator, job, exec_result.output, exec_result.success, b);
                             } else {
-                                _ = deliverResult(self.allocator, job.delivery, exec_result.output, exec_result.success, b) catch {};
+                                deliverCronResultChecked(self.allocator, job, exec_result.output, exec_result.success, b);
                             }
                         }
 
@@ -1015,6 +1015,54 @@ fn runAgentJob(
     timeout_secs: u64,
 ) !AgentRunResult {
     return agent_runner.run(allocator, cwd, prompt, model, timeout_secs);
+}
+
+fn deliveryShouldPublish(delivery: DeliveryConfig, output: []const u8, success: bool) bool {
+    if (delivery.mode == .none) return false;
+    if (delivery.channel == null) return false;
+    if (output.len == 0) return false;
+    return switch (delivery.mode) {
+        .none => false,
+        .on_success => success,
+        .on_error => !success,
+        .always => true,
+    };
+}
+
+fn markRequiredDeliveryFailure(job: *CronJob, reason: []const u8) void {
+    if (job.delivery.best_effort) return;
+    log.err("cron job '{s}' required delivery failed: {s}", .{ job.id, reason });
+    job.last_status = "error";
+}
+
+fn deliverCronResultChecked(
+    allocator: std.mem.Allocator,
+    job: *CronJob,
+    output: []const u8,
+    success: bool,
+    out_bus: *bus.Bus,
+) void {
+    const required = !job.delivery.best_effort and deliveryShouldPublish(job.delivery, output, success);
+    const delivered = deliverResult(allocator, job.delivery, output, success, out_bus) catch |err| {
+        markRequiredDeliveryFailure(job, @errorName(err));
+        return;
+    };
+    if (required and !delivered) markRequiredDeliveryFailure(job, "not_published");
+}
+
+fn deliverCronMainAgentChecked(
+    allocator: std.mem.Allocator,
+    job: *CronJob,
+    output: []const u8,
+    success: bool,
+    out_bus: *bus.Bus,
+) void {
+    const required = !job.delivery.best_effort and deliveryShouldPublish(job.delivery, output, success);
+    const delivered = deliverViaMainAgent(allocator, job.delivery, output, success, out_bus, job.name orelse job.id) catch |err| {
+        markRequiredDeliveryFailure(job, @errorName(err));
+        return;
+    };
+    if (required and !delivered) markRequiredDeliveryFailure(job, "not_published");
 }
 
 const LoadPolicy = enum {
@@ -1216,6 +1264,12 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             }
             break :blk null;
         };
+        const delivery_best_effort = blk: {
+            if (obj.get("delivery_best_effort")) |v| {
+                if (v == .bool) break :blk v.bool;
+            }
+            break :blk true;
+        };
         const session_target = blk: {
             if (obj.get("session_target")) |v| {
                 if (v == .string) {
@@ -1251,6 +1305,7 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
                 .peer_kind = delivery_peer_kind,
                 .peer_id = if (delivery_peer_id) |peer_id| try scheduler.allocator.dupe(u8, peer_id) else null,
                 .thread_id = if (delivery_thread_id) |thread_id| try scheduler.allocator.dupe(u8, thread_id) else null,
+                .best_effort = delivery_best_effort,
                 .channel_owned = delivery_channel != null,
                 .account_id_owned = delivery_account_id != null,
                 .to_owned = delivery_to != null,
@@ -1575,6 +1630,9 @@ fn appendCronJobJson(
     try buf.appendSlice(allocator, ",");
     try json_util.appendJsonKey(buf, allocator, "delivery_thread_id");
     try appendNullableString(buf, allocator, job.delivery.thread_id);
+    try buf.appendSlice(allocator, ",");
+    try json_util.appendJsonKey(buf, allocator, "delivery_best_effort");
+    try buf.appendSlice(allocator, if (job.delivery.best_effort) "true" else "false");
 
     try buf.appendSlice(allocator, "}");
 }

@@ -48,6 +48,8 @@ pub const DiscordChannel = struct {
 
     // Optional gateway fields (have defaults so existing init works)
     allow_from: []const []const u8 = &.{},
+    allowed_channels: []const []const u8 = &.{},
+    ignored_channels: []const []const u8 = &.{},
     require_mention: bool = false,
     intents: u32 = 37377, // GUILDS|GUILD_MESSAGES|MESSAGE_CONTENT|DIRECT_MESSAGES
     bus: ?*bus_mod.Bus = null,
@@ -125,9 +127,81 @@ pub const DiscordChannel = struct {
             .allow_bots = cfg.allow_bots,
             .account_id = cfg.account_id,
             .allow_from = cfg.allow_from,
+            .allowed_channels = cfg.allowed_channels,
+            .ignored_channels = cfg.ignored_channels,
             .require_mention = cfg.require_mention,
             .intents = cfg.intents,
         };
+    }
+
+    fn discordStatusOk(status_code: u16) bool {
+        return status_code >= 200 and status_code < 300;
+    }
+
+    fn ensureDiscordStatus(status_code: u16, action: []const u8) !void {
+        if (discordStatusOk(status_code)) return;
+        log.warn("Discord API {s} returned HTTP {d}", .{ action, status_code });
+        return error.DiscordApiError;
+    }
+
+    fn isChannelIgnored(self: *const DiscordChannel, channel_id: []const u8) bool {
+        return self.ignored_channels.len > 0 and
+            root.isAllowedScoped("discord ignored channel", self.ignored_channels, channel_id);
+    }
+
+    fn isChannelAllowedByList(self: *const DiscordChannel, channel_id: []const u8) bool {
+        return self.allowed_channels.len == 0 or
+            root.isAllowedScoped("discord allowed channel", self.allowed_channels, channel_id);
+    }
+
+    fn isInboundTargetAllowed(self: *const DiscordChannel, guild_id: ?[]const u8, channel_id: []const u8) bool {
+        if (self.isChannelIgnored(channel_id)) return false;
+        if (guild_id) |gid| {
+            if (self.guild_id) |configured_gid| {
+                if (!std.mem.eql(u8, configured_gid, gid)) return false;
+            }
+            return self.isChannelAllowedByList(channel_id);
+        }
+        return true;
+    }
+
+    fn fetchOutboundChannelGuildId(self: *DiscordChannel, channel_id: []const u8) !?[]u8 {
+        var url_buf: [256]u8 = undefined;
+        const url = try channelInfoUrl(&url_buf, channel_id);
+
+        var auth_buf: [512]u8 = undefined;
+        var auth_writer: std.Io.Writer = .fixed(&auth_buf);
+        try auth_writer.print("Authorization: Bot {s}", .{self.token});
+        const auth_header = auth_writer.buffered();
+
+        const resp = root.http_util.curlGetWithStatusAndTimeout(self.allocator, url, &.{auth_header}, "15") catch |err| {
+            log.warn("Discord API channel lookup failed: {}", .{err});
+            return error.DiscordApiError;
+        };
+        defer self.allocator.free(resp.body);
+        try ensureDiscordStatus(resp.status_code, "get channel");
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp.body, .{}) catch return null;
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+        const guild_val = parsed.value.object.get("guild_id") orelse return null;
+        if (guild_val != .string) return null;
+        return try self.allocator.dupe(u8, guild_val.string);
+    }
+
+    fn ensureOutboundChannelAllowed(self: *DiscordChannel, channel_id: []const u8) !void {
+        if (self.isChannelIgnored(channel_id)) return error.InvalidTarget;
+        if (self.allowed_channels.len == 0 and self.guild_id == null) return;
+
+        const guild_id = try self.fetchOutboundChannelGuildId(channel_id);
+        defer if (guild_id) |gid| self.allocator.free(gid);
+
+        if (guild_id) |gid| {
+            if (self.guild_id) |configured_gid| {
+                if (!std.mem.eql(u8, configured_gid, gid)) return error.InvalidTarget;
+            }
+            if (!self.isChannelAllowedByList(channel_id)) return error.InvalidTarget;
+        }
     }
 
     pub fn channelName(_: *DiscordChannel) []const u8 {
@@ -145,6 +219,12 @@ pub const DiscordChannel = struct {
     pub fn typingUrl(buf: []u8, channel_id: []const u8) ![]const u8 {
         var w: std.Io.Writer = .fixed(buf);
         try w.print("https://discord.com/api/v10/channels/{s}/typing", .{channel_id});
+        return w.buffered();
+    }
+
+    fn channelInfoUrl(buf: []u8, channel_id: []const u8) ![]const u8 {
+        var w: std.Io.Writer = .fixed(buf);
+        try w.print("https://discord.com/api/v10/channels/{s}", .{channel_id});
         return w.buffered();
     }
 
@@ -439,6 +519,8 @@ pub const DiscordChannel = struct {
     }
 
     fn sendChunk(self: *DiscordChannel, channel_id: []const u8, text: []const u8) !void {
+        try self.ensureOutboundChannelAllowed(channel_id);
+
         var url_buf: [256]u8 = undefined;
         const url = try sendUrl(&url_buf, channel_id);
 
@@ -456,11 +538,12 @@ pub const DiscordChannel = struct {
         try auth_writer.print("Authorization: Bot {s}", .{self.token});
         const auth_header = auth_writer.buffered();
 
-        const resp = root.http_util.curlPost(self.allocator, url, body_list.items, &.{auth_header}) catch |err| {
+        const resp = root.http_util.curlPostWithStatusAndTimeout(self.allocator, url, body_list.items, &.{auth_header}, "30") catch |err| {
             log.err("Discord API POST failed: {}", .{err});
             return error.DiscordApiError;
         };
-        self.allocator.free(resp);
+        defer self.allocator.free(resp.body);
+        try ensureDiscordStatus(resp.status_code, "send message");
     }
 
     fn sendJsonMethod(self: *DiscordChannel, method: []const u8, url: []const u8, body: []const u8) !void {
@@ -489,6 +572,10 @@ pub const DiscordChannel = struct {
         argv_buf[argc] = "--data-binary";
         argc += 1;
         argv_buf[argc] = "@-";
+        argc += 1;
+        argv_buf[argc] = "-w";
+        argc += 1;
+        argv_buf[argc] = "\n%{http_code}";
         argc += 1;
         argv_buf[argc] = url;
         argc += 1;
@@ -527,6 +614,12 @@ pub const DiscordChannel = struct {
             .exited => |code| if (code != 0) return error.DiscordApiError,
             else => return error.DiscordApiError,
         }
+
+        const status_sep = std.mem.lastIndexOfScalar(u8, stdout, '\n') orelse return error.DiscordApiError;
+        const status_raw = std.mem.trim(u8, stdout[status_sep + 1 ..], " \t\r\n");
+        if (status_raw.len != 3) return error.DiscordApiError;
+        const status_code = std.fmt.parseInt(u16, status_raw, 10) catch return error.DiscordApiError;
+        try ensureDiscordStatus(status_code, method);
     }
 
     fn nextInteractionToken(self: *DiscordChannel) ![]u8 {
@@ -710,6 +803,8 @@ pub const DiscordChannel = struct {
     }
 
     fn sendRichMessage(self: *DiscordChannel, channel_id: []const u8, payload: root.Channel.OutboundPayload) !void {
+        try self.ensureOutboundChannelAllowed(channel_id);
+
         if (payload.attachments.len > 0) return error.NotSupported;
         if (payload.choices.len == 0) return self.sendMessage(channel_id, payload.text);
 
@@ -737,11 +832,12 @@ pub const DiscordChannel = struct {
         try auth_writer.print("Authorization: Bot {s}", .{self.token});
         const auth_header = auth_writer.buffered();
 
-        const resp = root.http_util.curlPost(self.allocator, url, body.items, &.{auth_header}) catch |err| {
+        const resp = root.http_util.curlPostWithStatusAndTimeout(self.allocator, url, body.items, &.{auth_header}, "30") catch |err| {
             log.err("Discord API rich POST failed: {}", .{err});
             return error.DiscordApiError;
         };
-        defer self.allocator.free(resp);
+        defer self.allocator.free(resp.body);
+        try ensureDiscordStatus(resp.status_code, "send rich message");
 
         try self.registerPendingInteraction(token, channel_id, directive);
     }
@@ -792,8 +888,12 @@ pub const DiscordChannel = struct {
         const owned_body = body catch return;
         defer self.allocator.free(owned_body);
 
-        const resp = root.http_util.curlPost(self.allocator, url, owned_body, &.{}) catch return;
-        self.allocator.free(resp);
+        const resp = root.http_util.curlPostWithStatusAndTimeout(self.allocator, url, owned_body, &.{}, "15") catch |err| {
+            log.warn("Discord interaction callback failed: {}", .{err});
+            return;
+        };
+        defer self.allocator.free(resp.body);
+        ensureDiscordStatus(resp.status_code, "answer interaction") catch return;
     }
 
     // ── Gateway ──────────────────────────────────────────────────────
@@ -1303,6 +1403,8 @@ pub const DiscordChannel = struct {
             else => null,
         } else null;
 
+        if (!self.isInboundTargetAllowed(guild_id, channel_id)) return;
+
         // Extract author object
         const author_obj = if (d_obj.get("author")) |v| switch (v) {
             .object => |o| o,
@@ -1501,6 +1603,7 @@ pub const DiscordChannel = struct {
             .string => |s| s,
             else => null,
         } else null;
+        if (!self.isInboundTargetAllowed(guild_id, channel_id)) return;
 
         const data_val = d_obj.get("data") orelse {
             self.answerInteraction(interaction_id, interaction_token, "Unsupported interaction");

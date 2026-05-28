@@ -598,6 +598,8 @@ pub const DiscordConfig = struct {
     guild_id: ?[]const u8 = null,
     allow_bots: bool = false,
     allow_from: []const []const u8 = &.{},
+    allowed_channels: []const []const u8 = &.{},
+    ignored_channels: []const []const u8 = &.{},
     require_mention: bool = false,
     intents: u32 = 37377, // GUILDS|GUILD_MESSAGES|MESSAGE_CONTENT|DIRECT_MESSAGES
 };
