@@ -1,3 +1,13 @@
+## Recent hardening work
+
+This branch includes a focused set of reliability and security improvements for long-running NullClaw deployments:
+
+- Queued inbound messages by default so concurrent Telegram and Discord requests are serialized instead of silently dropped.
+- More explicit outbound delivery handling for Discord and Telegram, including REST status checks and clearer queued-versus-sent behavior.
+- Discord REST compatibility improvements, including a proper bot user agent and safer guild/channel routing.
+- Leaner durable memory recall that filters internal autosaves while preserving high-value long-term memory categories.
+- Safer curl-based provider and channel calls that keep live credentials out of process arguments.
+
 Want a simpler way to install and configure nullclaw with a UI? Try [nullhub](https://github.com/nullclaw/nullhub)! (currently in beta)
 
 [nullhub](https://github.com/nullclaw/nullhub) provides a UI layer for the Null ecosystem: simpler nullclaw setup and configuration, orchestration from [nullboiler](https://github.com/nullclaw/nullboiler), observability from [nullwatch](https://github.com/nullclaw/nullwatch), and task tracking from [nulltickets](https://github.com/nullclaw/nulltickets).
