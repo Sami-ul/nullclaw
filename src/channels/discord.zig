@@ -12,6 +12,7 @@ const Atomic = @import("../portable_atomic.zig").Atomic;
 const log = std.log.scoped(.discord);
 
 const PENDING_INTERACTION_TTL_MS: u64 = 60 * std.time.ms_per_min;
+const DISCORD_USER_AGENT_HEADER = "User-Agent: DiscordBot (https://github.com/nullclaw/nullclaw, 1.0)";
 
 const PendingInteractionOption = struct {
     id: []const u8,
@@ -174,7 +175,7 @@ pub const DiscordChannel = struct {
         try auth_writer.print("Authorization: Bot {s}", .{self.token});
         const auth_header = auth_writer.buffered();
 
-        const resp = root.http_util.curlGetWithStatusAndTimeout(self.allocator, url, &.{auth_header}, "15") catch |err| {
+        const resp = root.http_util.curlGetWithStatusAndTimeout(self.allocator, url, &.{ auth_header, DISCORD_USER_AGENT_HEADER }, "15") catch |err| {
             log.warn("Discord API channel lookup failed: {}", .{err});
             return error.DiscordApiError;
         };
@@ -438,7 +439,7 @@ pub const DiscordChannel = struct {
         auth_writer.print("Authorization: Bot {s}", .{self.token}) catch return;
         const auth_header = auth_writer.buffered();
 
-        const resp = root.http_util.curlPost(self.allocator, url, "{}", &.{auth_header}) catch return;
+        const resp = root.http_util.curlPost(self.allocator, url, "{}", &.{ auth_header, DISCORD_USER_AGENT_HEADER }) catch return;
         self.allocator.free(resp);
     }
 
@@ -538,7 +539,7 @@ pub const DiscordChannel = struct {
         try auth_writer.print("Authorization: Bot {s}", .{self.token});
         const auth_header = auth_writer.buffered();
 
-        const resp = root.http_util.curlPostWithStatusAndTimeout(self.allocator, url, body_list.items, &.{auth_header}, "30") catch |err| {
+        const resp = root.http_util.curlPostWithStatusAndTimeout(self.allocator, url, body_list.items, &.{ auth_header, DISCORD_USER_AGENT_HEADER }, "30") catch |err| {
             log.err("Discord API POST failed: {}", .{err});
             return error.DiscordApiError;
         };
@@ -560,6 +561,10 @@ pub const DiscordChannel = struct {
         argv_buf[argc] = "-H";
         argc += 1;
         argv_buf[argc] = "Content-Type: application/json";
+        argc += 1;
+        argv_buf[argc] = "-H";
+        argc += 1;
+        argv_buf[argc] = DISCORD_USER_AGENT_HEADER;
         argc += 1;
 
         var auth_buf: [512]u8 = undefined;
@@ -832,7 +837,7 @@ pub const DiscordChannel = struct {
         try auth_writer.print("Authorization: Bot {s}", .{self.token});
         const auth_header = auth_writer.buffered();
 
-        const resp = root.http_util.curlPostWithStatusAndTimeout(self.allocator, url, body.items, &.{auth_header}, "30") catch |err| {
+        const resp = root.http_util.curlPostWithStatusAndTimeout(self.allocator, url, body.items, &.{ auth_header, DISCORD_USER_AGENT_HEADER }, "30") catch |err| {
             log.err("Discord API rich POST failed: {}", .{err});
             return error.DiscordApiError;
         };
@@ -888,7 +893,7 @@ pub const DiscordChannel = struct {
         const owned_body = body catch return;
         defer self.allocator.free(owned_body);
 
-        const resp = root.http_util.curlPostWithStatusAndTimeout(self.allocator, url, owned_body, &.{}, "15") catch |err| {
+        const resp = root.http_util.curlPostWithStatusAndTimeout(self.allocator, url, owned_body, &.{DISCORD_USER_AGENT_HEADER}, "15") catch |err| {
             log.warn("Discord interaction callback failed: {}", .{err});
             return;
         };
