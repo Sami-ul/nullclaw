@@ -623,6 +623,7 @@ pub const MemoryRuntime = struct {
                 // Use engine if available, else fall back
                 if (self._engine) |engine| {
                     const candidates = try engine.search(allocator, query, session_id);
+                    self.hydrateKeyOnlyCandidates(allocator, candidates, session_id);
                     return trimCandidatesToLimit(allocator, candidates, limit);
                 }
                 const entries = try self.memory.recall(allocator, query, limit, session_id);
@@ -647,6 +648,65 @@ pub const MemoryRuntime = struct {
 
                 return keyword_results;
             },
+        }
+    }
+
+    fn cloneCategoryForRuntime(allocator: std.mem.Allocator, category: MemoryCategory) !MemoryCategory {
+        return switch (category) {
+            .custom => |name| .{ .custom = try allocator.dupe(u8, name) },
+            else => category,
+        };
+    }
+
+    fn freeRuntimeCategory(allocator: std.mem.Allocator, category: MemoryCategory) void {
+        switch (category) {
+            .custom => |name| allocator.free(name),
+            else => {},
+        }
+    }
+
+    fn hydrateKeyOnlyCandidates(
+        self: *MemoryRuntime,
+        allocator: std.mem.Allocator,
+        candidates: []RetrievalCandidate,
+        session_id: ?[]const u8,
+    ) void {
+        for (candidates) |*candidate| {
+            const key_only = std.mem.eql(u8, candidate.content, candidate.key) or
+                std.mem.eql(u8, candidate.snippet, candidate.key);
+            if (!key_only) continue;
+
+            var entry = self.memory.getScoped(allocator, candidate.key, session_id) catch |err| {
+                log.warn("memory vector hydration failed for key '{s}': {}", .{ candidate.key, err });
+                continue;
+            } orelse continue;
+            defer entry.deinit(allocator);
+
+            const content = allocator.dupe(u8, entry.content) catch |err| {
+                log.warn("memory vector hydration allocation failed for key '{s}': {}", .{ candidate.key, err });
+                continue;
+            };
+
+            const snippet = allocator.dupe(u8, entry.content) catch |err| {
+                log.warn("memory vector hydration allocation failed for key '{s}': {}", .{ candidate.key, err });
+                allocator.free(content);
+                continue;
+            };
+
+            const category = cloneCategoryForRuntime(allocator, entry.category) catch |err| {
+                log.warn("memory vector hydration category clone failed for key '{s}': {}", .{ candidate.key, err });
+                allocator.free(content);
+                allocator.free(snippet);
+                continue;
+            };
+
+            allocator.free(candidate.content);
+            allocator.free(candidate.snippet);
+            freeRuntimeCategory(allocator, candidate.category);
+            candidate.content = content;
+            candidate.snippet = snippet;
+            candidate.category = category;
+            candidate.created_at = std.fmt.parseInt(i64, entry.timestamp, 10) catch candidate.created_at;
         }
     }
 
@@ -2070,6 +2130,53 @@ test "MemoryRuntime.search without engine falls back to recall" {
     const results = try rt.search(std.testing.allocator, "query", 5, null);
     defer retrieval.freeCandidates(std.testing.allocator, results);
     try std.testing.expectEqual(@as(usize, 0), results.len);
+}
+
+test "MemoryRuntime hydrates key-only vector candidates" {
+    if (!build_options.enable_sqlite) return;
+
+    const allocator = std.testing.allocator;
+    var db = try sqlite.SqliteMemory.init(allocator, ":memory:");
+    defer db.deinit();
+
+    try db.memory().store("project.signal", "hydrated durable project content", .{ .custom = "project" }, null);
+
+    var rt = MemoryRuntime{
+        .memory = db.memory(),
+        .session_store = null,
+        .response_cache = null,
+        .capabilities = .{ .supports_keyword_rank = false, .supports_session_store = false, .supports_transactions = false, .supports_outbox = false },
+        .resolved = test_resolved_cfg,
+        ._db_path = null,
+        ._cache_db_path = null,
+        ._engine = null,
+        ._allocator = allocator,
+        ._embedding_provider = null,
+        ._vector_store = null,
+        ._circuit_breaker = null,
+        ._outbox = null,
+    };
+
+    var candidates = try allocator.alloc(RetrievalCandidate, 1);
+    candidates[0] = .{
+        .id = try allocator.dupe(u8, "project.signal"),
+        .key = try allocator.dupe(u8, "project.signal"),
+        .content = try allocator.dupe(u8, "project.signal"),
+        .snippet = try allocator.dupe(u8, "project.signal"),
+        .category = .daily,
+        .keyword_rank = null,
+        .vector_score = 0.9,
+        .final_score = 0.9,
+        .source = try allocator.dupe(u8, "vector"),
+        .source_path = try allocator.dupe(u8, ""),
+        .start_line = 0,
+        .end_line = 0,
+    };
+    defer retrieval.freeCandidates(allocator, candidates);
+
+    rt.hydrateKeyOnlyCandidates(allocator, candidates, null);
+    try std.testing.expectEqualStrings("hydrated durable project content", candidates[0].content);
+    try std.testing.expectEqualStrings("project", candidates[0].category.custom);
 }
 
 test "MemoryRuntime.search with engine delegates" {

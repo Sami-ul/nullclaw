@@ -103,6 +103,29 @@ pub fn freeCandidates(allocator: Allocator, candidates: []RetrievalCandidate) vo
     allocator.free(candidates);
 }
 
+fn isNoisyRetrievalCandidate(candidate: *const RetrievalCandidate) bool {
+    if (root.isInternalMemoryEntryKeyOrContent(candidate.key, candidate.content)) return true;
+    if (root.isInternalMemoryEntryKeyOrContent(candidate.key, candidate.snippet)) return true;
+    if (std.mem.startsWith(u8, candidate.key, "autosave_")) return true;
+    return switch (candidate.category) {
+        .conversation => std.mem.startsWith(u8, candidate.key, "autosave_"),
+        else => false,
+    };
+}
+
+fn filterNoisyCandidates(allocator: Allocator, candidates: []RetrievalCandidate) []RetrievalCandidate {
+    var keep: usize = 0;
+    for (candidates, 0..) |*candidate, idx| {
+        if (!isNoisyRetrievalCandidate(candidate)) {
+            if (keep != idx) candidates[keep] = candidate.*;
+            keep += 1;
+        } else {
+            candidate.deinit(allocator);
+        }
+    }
+    return shrinkAlloc(allocator, candidates, keep);
+}
+
 /// Convert MemoryEntry slice to RetrievalCandidate slice.
 /// Caller owns the returned slice. Entries are NOT freed.
 pub fn entriesToCandidates(allocator: Allocator, entries: []const MemoryEntry) ![]RetrievalCandidate {
@@ -406,6 +429,7 @@ pub const RetrievalEngine = struct {
                 source_results[i] = &.{};
                 continue;
             };
+            source_results[i] = filterNoisyCandidates(allocator, source_results[i]);
             if (source_results[i].len > 0) valid_count += 1;
         }
 
@@ -464,12 +488,14 @@ pub const RetrievalEngine = struct {
             if (vec_results.len == 0) break :hybrid_blk;
 
             // Convert VectorResults to RetrievalCandidates
-            vector_candidates = vectorResultsToCandidates(allocator, vec_results, session_id) catch |err| {
+            var converted = vectorResultsToCandidates(allocator, vec_results, session_id) catch |err| {
                 log.warn("vector result conversion failed: {}", .{err});
                 break :hybrid_blk;
             };
+            converted = filterNoisyCandidates(allocator, converted);
+            vector_candidates = converted;
 
-            valid_count += 1;
+            if (converted.len > 0) valid_count += 1;
         }
 
         // Single source with results → set final_score from keyword_rank, skip RRF
@@ -992,6 +1018,31 @@ test "Engine.search applies top_k truncation" {
     const results = try engine.search(allocator, "searchable", null);
     defer freeCandidates(allocator, results);
     try std.testing.expect(results.len <= 2);
+}
+
+test "Engine.search filters autosave conversation before ranking" {
+    if (!build_options.enable_sqlite) return;
+
+    const allocator = std.testing.allocator;
+    var db = try sqlite_mod.SqliteMemory.init(allocator, ":memory:");
+    defer db.deinit();
+    const mem = db.memory();
+
+    try mem.store("autosave_user_noise", "searchable transient chat noise", .conversation, null);
+    try mem.store("project.signal", "searchable durable project fact", .{ .custom = "project" }, null);
+
+    var pa = PrimaryAdapter.init(mem);
+    var engine = RetrievalEngine.init(allocator, .{ .max_results = 10 });
+    defer engine.deinit();
+    try engine.addSource(pa.adapter());
+
+    const results = try engine.search(allocator, "searchable", null);
+    defer freeCandidates(allocator, results);
+
+    try std.testing.expect(results.len >= 1);
+    for (results) |candidate| {
+        try std.testing.expect(!std.mem.startsWith(u8, candidate.key, "autosave_"));
+    }
 }
 
 test "Engine.deinit cleans up sources" {

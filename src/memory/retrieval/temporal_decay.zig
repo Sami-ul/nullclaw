@@ -7,7 +7,7 @@
 //!   where   lambda = ln(2) / half_life_days
 //!
 //! At age == half_life_days the multiplier is exactly 0.5.
-//! Evergreen entries (category == .core) are never decayed.
+//! Evergreen entries (category == .core or durable custom categories) are never decayed.
 
 const std = @import("std");
 const retrieval = @import("engine.zig");
@@ -45,12 +45,27 @@ pub fn isEvergreen(path: []const u8) bool {
         std.mem.endsWith(u8, path, "memory.md");
 }
 
+pub fn isEvergreenCategory(category: MemoryCategory) bool {
+    return switch (category) {
+        .core => true,
+        .custom => |name| std.mem.eql(u8, name, "profile") or
+            std.mem.eql(u8, name, "preference") or
+            std.mem.eql(u8, name, "project") or
+            std.mem.eql(u8, name, "procedure") or
+            std.mem.eql(u8, name, "application") or
+            std.mem.eql(u8, name, "strategy") or
+            std.mem.eql(u8, name, "privacy") or
+            std.mem.eql(u8, name, "integration"),
+        else => false,
+    };
+}
+
 // ── Pipeline stage ───────────────────────────────────────────────
 
 const secs_per_day: f64 = 86400.0;
 
 /// Apply temporal decay to candidate scores in-place.
-/// Evergreen candidates (category == .core) are not decayed.
+/// Evergreen candidates (category == .core or durable custom categories) are not decayed.
 /// Candidates with created_at == 0 (unknown timestamp) are not decayed.
 pub fn applyTemporalDecay(
     candidates: []RetrievalCandidate,
@@ -63,8 +78,8 @@ pub fn applyTemporalDecay(
     const lambda = decayLambda(config.half_life_days);
 
     for (candidates) |*c| {
-        // Skip evergreen (core) entries
-        if (c.category == .core) continue;
+        // Skip evergreen durable entries
+        if (isEvergreenCategory(c.category)) continue;
 
         // Skip entries with no known timestamp
         if (c.created_at == 0) continue;
@@ -184,6 +199,16 @@ test "applyTemporalDecay core category never decayed" {
     const now = created + 365 * 86400;
     var candidates = [_]RetrievalCandidate{
         makeCandidate(.core, 1.0, created),
+    };
+    applyTemporalDecay(&candidates, .{ .enabled = true, .half_life_days = 30 }, now);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), candidates[0].final_score, 1e-10);
+}
+
+test "applyTemporalDecay durable custom category never decayed" {
+    const created = 1000000;
+    const now = created + 365 * 86400;
+    var candidates = [_]RetrievalCandidate{
+        makeCandidate(.{ .custom = "project" }, 1.0, created),
     };
     applyTemporalDecay(&candidates, .{ .enabled = true, .half_life_days = 30 }, now);
     try std.testing.expectApproxEqAbs(@as(f64, 1.0), candidates[0].final_score, 1e-10);

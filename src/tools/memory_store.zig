@@ -14,9 +14,9 @@ pub const MemoryStoreTool = struct {
     mem_rt: ?*mem_root.MemoryRuntime = null,
 
     pub const tool_name = "memory_store";
-    pub const tool_description = "Store durable user facts, preferences, and decisions in long-term memory. Omit session_id for cross-session memory. Use category 'core' for stable facts, 'daily' for short-lived reminders, 'conversation' for important context only. Do not store routine greetings or every chat message.";
+    pub const tool_description = "Store atomic durable memory. Omit session_id for cross-session memory. Prefer durable categories: profile, preference, project, procedure, application, strategy, privacy, integration, or core. Use daily for short-lived reminders and conversation only for rare important transcript context. Do not store routine greetings or every chat message.";
     pub const tool_params =
-        \\{"type":"object","properties":{"key":{"type":"string","description":"Unique key for this memory"},"content":{"type":"string","description":"The information to remember"},"category":{"type":"string","enum":["core","daily","conversation"],"description":"Memory category"},"session_id":{"type":"string","description":"Optional session scope. Omit for durable cross-session memory; pass an empty string to use the current thread session."}},"required":["key","content"]}
+        \\{"type":"object","properties":{"key":{"type":"string","description":"Unique key for this memory"},"content":{"type":"string","description":"The information to remember"},"category":{"type":"string","enum":["profile","preference","project","procedure","application","strategy","privacy","integration","core","daily","conversation"],"description":"Memory category. Prefer durable custom categories over conversation."},"session_id":{"type":"string","description":"Optional session scope. Omit for durable cross-session memory; pass an empty string to use the current thread session."}},"required":["key","content"]}
     ;
 
     pub const vtable = root.ToolVTable(@This());
@@ -81,6 +81,14 @@ test "memory_store schema has key and content" {
     const schema = t.parametersJson();
     try std.testing.expect(std.mem.indexOf(u8, schema, "key") != null);
     try std.testing.expect(std.mem.indexOf(u8, schema, "content") != null);
+}
+
+test "memory_store schema advertises durable categories" {
+    var mt = MemoryStoreTool{};
+    const schema = mt.tool().parametersJson();
+    try std.testing.expect(std.mem.indexOf(u8, schema, "preference") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "procedure") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "conversation") != null);
 }
 
 test "memory_store executes without backend" {
