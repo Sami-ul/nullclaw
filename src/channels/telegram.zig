@@ -1570,6 +1570,23 @@ pub const TelegramChannel = struct {
         try self.editMessageWithMarkdownFallback(edit.target, message_id, edit.payload.text, null);
     }
 
+    pub fn sendTrackedMessage(self: *TelegramChannel, target: []const u8, text: []const u8) !?root.Channel.MessageRef {
+        const sent = try self.sendWithMarkdownFallbackWithMarkup(target, text, null, null);
+        const message_id = sent.message_id orelse return error.InvalidMessageRef;
+        const message_id_text = try std.fmt.allocPrint(self.allocator, "{d}", .{message_id});
+        errdefer self.allocator.free(message_id_text);
+        const target_copy = try self.allocator.dupe(u8, target);
+        return .{
+            .target = target_copy,
+            .message_id = message_id_text,
+        };
+    }
+
+    pub fn deleteTrackedMessage(self: *TelegramChannel, message_ref: root.Channel.MessageRef) !void {
+        const message_id = std.fmt.parseInt(i64, message_ref.message_id, 10) catch return error.InvalidMessageRef;
+        try self.api().deleteMessage(self.allocator, targetChatId(message_ref.target), message_id);
+    }
+
     // ── HTML fallback ────────────────────────────────────────────────
 
     /// Send text with HTML parse_mode (converted from Markdown); on failure, retry as plain text.
@@ -3315,9 +3332,24 @@ pub const TelegramChannel = struct {
         try self.editRichMessage(edit);
     }
 
+    fn vtableSendTracked(ptr: *anyopaque, target: []const u8, message: []const u8) anyerror!?root.Channel.MessageRef {
+        const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
+        return self.sendTrackedMessage(target, message);
+    }
+
+    fn vtableDeleteMessage(ptr: *anyopaque, message_ref: root.Channel.MessageRef) anyerror!void {
+        const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
+        try self.deleteTrackedMessage(message_ref);
+    }
+
     fn vtableSupportsStreamingOutbound(ptr: *anyopaque) bool {
         const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
         return self.streaming_enabled and self.draft_previews_enabled;
+    }
+
+    fn vtableSupportsTrackedDrafts(ptr: *anyopaque) bool {
+        const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
+        return self.streaming_enabled;
     }
 
     pub const vtable = root.Channel.VTable{
@@ -3326,13 +3358,16 @@ pub const TelegramChannel = struct {
         .send = &vtableSend,
         .sendEvent = &vtableSendEvent,
         .sendRich = &vtableSendRich,
+        .sendTracked = &vtableSendTracked,
         .name = &vtableName,
         .healthCheck = &vtableHealthCheck,
         .startTyping = &vtableStartTyping,
         .stopTyping = &vtableStopTyping,
         .editMessage = &vtableEditMessage,
+        .deleteMessage = &vtableDeleteMessage,
         .setReaction = &vtableSetReaction,
         .supportsStreamingOutbound = &vtableSupportsStreamingOutbound,
+        .supportsTrackedDrafts = &vtableSupportsTrackedDrafts,
     };
 
     pub fn channel(self: *TelegramChannel) root.Channel {

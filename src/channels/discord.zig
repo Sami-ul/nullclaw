@@ -547,6 +547,48 @@ pub const DiscordChannel = struct {
         try ensureDiscordStatus(resp.status_code, "send message");
     }
 
+    fn parseMessageId(self: *DiscordChannel, body: []const u8) ![]u8 {
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, body, .{}) catch return error.DiscordApiError;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.DiscordApiError;
+        const id_val = parsed.value.object.get("id") orelse return error.DiscordApiError;
+        if (id_val != .string or id_val.string.len == 0) return error.DiscordApiError;
+        return self.allocator.dupe(u8, id_val.string);
+    }
+
+    pub fn sendTrackedMessage(self: *DiscordChannel, channel_id: []const u8, text: []const u8) !?root.Channel.MessageRef {
+        try self.ensureOutboundChannelAllowed(channel_id);
+
+        var url_buf: [256]u8 = undefined;
+        const url = try sendUrl(&url_buf, channel_id);
+
+        var body_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_list.deinit(self.allocator);
+        try body_list.appendSlice(self.allocator, "{\"content\":");
+        try root.json_util.appendJsonString(&body_list, self.allocator, text);
+        try body_list.appendSlice(self.allocator, "}");
+
+        var auth_buf: [512]u8 = undefined;
+        var auth_writer: std.Io.Writer = .fixed(&auth_buf);
+        try auth_writer.print("Authorization: Bot {s}", .{self.token});
+        const auth_header = auth_writer.buffered();
+
+        const resp = root.http_util.curlPostWithStatusAndTimeout(self.allocator, url, body_list.items, &.{ auth_header, DISCORD_USER_AGENT_HEADER }, "30") catch |err| {
+            log.err("Discord API tracked POST failed: {}", .{err});
+            return error.DiscordApiError;
+        };
+        defer self.allocator.free(resp.body);
+        try ensureDiscordStatus(resp.status_code, "send tracked message");
+
+        const message_id = try self.parseMessageId(resp.body);
+        errdefer self.allocator.free(message_id);
+        const target_copy = try self.allocator.dupe(u8, channel_id);
+        return .{
+            .target = target_copy,
+            .message_id = message_id,
+        };
+    }
+
     fn sendJsonMethod(self: *DiscordChannel, method: []const u8, url: []const u8, body: []const u8) !void {
         var config: std.ArrayListUnmanaged(u8) = .empty;
         defer config.deinit(self.allocator);
@@ -954,6 +996,22 @@ pub const DiscordChannel = struct {
         try self.editRichMessage(edit);
     }
 
+    fn vtableSendTracked(ptr: *anyopaque, target: []const u8, message: []const u8) anyerror!?root.Channel.MessageRef {
+        const self: *DiscordChannel = @ptrCast(@alignCast(ptr));
+        return self.sendTrackedMessage(target, message);
+    }
+
+    fn vtableDeleteMessage(ptr: *anyopaque, message_ref: root.Channel.MessageRef) anyerror!void {
+        const self: *DiscordChannel = @ptrCast(@alignCast(ptr));
+        var url_buf: [256]u8 = undefined;
+        const url = try editMessageUrl(&url_buf, message_ref.target, message_ref.message_id);
+        try self.sendJsonMethod("DELETE", url, "{}");
+    }
+
+    fn vtableSupportsTrackedDrafts(_: *anyopaque) bool {
+        return true;
+    }
+
     fn vtableName(ptr: *anyopaque) []const u8 {
         const self: *DiscordChannel = @ptrCast(@alignCast(ptr));
         return self.channelName();
@@ -979,11 +1037,14 @@ pub const DiscordChannel = struct {
         .stop = &vtableStop,
         .send = &vtableSend,
         .sendRich = &vtableSendRich,
+        .sendTracked = &vtableSendTracked,
         .editMessage = &vtableEditMessage,
+        .deleteMessage = &vtableDeleteMessage,
         .name = &vtableName,
         .healthCheck = &vtableHealthCheck,
         .startTyping = &vtableStartTyping,
         .stopTyping = &vtableStopTyping,
+        .supportsTrackedDrafts = &vtableSupportsTrackedDrafts,
     };
 
     pub fn channel(self: *DiscordChannel) root.Channel {

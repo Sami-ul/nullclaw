@@ -130,6 +130,23 @@ pub const Client = struct {
         self.allocator.free(resp);
     }
 
+    pub fn deleteMessage(self: Client, allocator: std.mem.Allocator, chat_id: []const u8, message_id: i64) !void {
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        defer body.deinit(allocator);
+
+        try body.appendSlice(allocator, "{\"chat_id\":");
+        try root.json_util.appendJsonString(&body, allocator, chat_id);
+        try body.appendSlice(allocator, ",\"message_id\":");
+        var msg_id_buf: [32]u8 = undefined;
+        const msg_id_str = try std.fmt.bufPrint(&msg_id_buf, "{d}", .{message_id});
+        try body.appendSlice(allocator, msg_id_str);
+        try body.appendSlice(allocator, "}");
+
+        const resp = try self.post(allocator, "deleteMessage", body.items, "15");
+        defer allocator.free(resp);
+        if (responseHasTelegramError(resp)) return error.TelegramApiError;
+    }
+
     pub fn editMessageText(self: Client, allocator: std.mem.Allocator, chat_id: []const u8, message_id: i64, text: []const u8, reply_markup_json: ?[]const u8) ![]u8 {
         const body = try buildEditMessageTextBody(allocator, chat_id, message_id, text, reply_markup_json, null);
         defer allocator.free(body);

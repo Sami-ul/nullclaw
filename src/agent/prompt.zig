@@ -458,8 +458,29 @@ fn buildIdentitySection(
         &hit_total_bootstrap_limit,
     );
 
-    const identity_files = [_][]const u8{
+    try injectWorkspaceFile(
+        allocator,
+        w,
+        workspace_dir,
         "AGENTS.md",
+        bootstrap_provider,
+        &remaining_bootstrap_chars,
+        &hit_total_bootstrap_limit,
+    );
+
+    // Inject MEMORY.md immediately after AGENTS.md so pinned continuity sits
+    // before lower-priority workspace notes and before volatile conversation
+    // history.
+    try injectPreferredMemoryFile(
+        allocator,
+        w,
+        workspace_dir,
+        bootstrap_provider,
+        &remaining_bootstrap_chars,
+        &hit_total_bootstrap_limit,
+    );
+
+    const identity_files = [_][]const u8{
         "SOUL.md",
         "TOOLS.md",
         "CONFIG.md",
@@ -480,16 +501,6 @@ fn buildIdentitySection(
             &hit_total_bootstrap_limit,
         );
     }
-
-    // Inject MEMORY.md if present, otherwise fallback to memory.md.
-    try injectPreferredMemoryFile(
-        allocator,
-        w,
-        workspace_dir,
-        bootstrap_provider,
-        &remaining_bootstrap_chars,
-        &hit_total_bootstrap_limit,
-    );
 
     if (hit_total_bootstrap_limit) {
         try w.print(

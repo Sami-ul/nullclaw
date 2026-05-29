@@ -5535,6 +5535,7 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
         .stop => return try handleStopCommand(self),
         .compact => {
             if (self.forceCompressHistory()) {
+                self.last_turn_compacted = true;
                 return try self.allocator.dupe(u8, "Context compacted.");
             }
             return try self.allocator.dupe(u8, "Nothing to compact.");

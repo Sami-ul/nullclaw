@@ -136,7 +136,23 @@ fn persistCliTurn(agent: *const Agent, content: []const u8, response: []const u8
     turn_persistence.persistTurn(store, .{
         .history = agent.history.items,
         .total_tokens = agent.total_tokens,
+        .rewrite_session_history = agent.last_turn_compacted,
     }, session_key, persisted_content orelse content, persisted_response orelse response);
+}
+
+fn restoreCliSessionHistory(allocator: std.mem.Allocator, agent: *Agent) void {
+    const store = agent.session_store orelse return;
+    const session_key = agent.memory_session_id orelse return;
+
+    const maybe_entries = store.loadMessages(allocator, session_key) catch null;
+    const entries = maybe_entries orelse return;
+    defer memory_mod.freeMessages(allocator, entries);
+
+    if (entries.len == 0) return;
+    agent.loadHistory(entries) catch return;
+    if (store.loadUsage(session_key) catch null) |total_tokens| {
+        agent.total_tokens = total_tokens;
+    }
 }
 
 fn printPendingSubagentNotices(
@@ -626,6 +642,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         } else if (agent_memory_session_id) |memory_session_id| {
             agent.memory_session_id = memory_session_id;
         }
+        restoreCliSessionHistory(allocator, &agent);
         if (parsed_args.skill_name) |sname| {
             _ = try commands.activateSkillByName(&agent, sname);
         }
@@ -769,6 +786,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     } else if (agent_memory_session_id) |memory_session_id| {
         agent.memory_session_id = memory_session_id;
     }
+    restoreCliSessionHistory(allocator, &agent);
     if (parsed_args.skill_name) |sname| {
         _ = try commands.activateSkillByName(&agent, sname);
     }

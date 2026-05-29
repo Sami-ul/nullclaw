@@ -1941,6 +1941,7 @@ pub const SessionManager = struct {
             turn_persistence.persistTurn(store, .{
                 .history = session.agent.history.items,
                 .total_tokens = session.agent.total_tokens,
+                .rewrite_session_history = session.agent.last_turn_compacted,
             }, session_key, persisted_content orelse content, persisted_response orelse response);
         }
 

@@ -318,6 +318,7 @@ pub const Agent = struct {
     /// Models auto-detected as not supporting vision (built at runtime).
     detected_vision_disabled: std.ArrayListUnmanaged([]const u8) = .empty,
     max_tool_iterations: u32,
+    compact_context: bool = false,
     max_history_messages: u32,
     auto_save: bool,
     token_limit: u64 = 0,
@@ -633,6 +634,7 @@ pub const Agent = struct {
             .vision_disabled_models = cfg.agent.vision_disabled_models,
             .auto_disable_vision_on_error = cfg.agent.auto_disable_vision_on_error,
             .max_tool_iterations = cfg.agent.max_tool_iterations,
+            .compact_context = cfg.agent.compact_context,
             .max_history_messages = cfg.agent.max_history_messages,
             .auto_save = cfg.memory.auto_save,
             .token_limit = resolved_token_limit,
@@ -880,6 +882,7 @@ pub const Agent = struct {
 
     /// Auto-compact history when it exceeds thresholds.
     pub fn autoCompactHistory(self: *Agent) !bool {
+        if (!self.compact_context) return false;
         return compaction.autoCompactHistory(self.allocator, &self.history, self.provider, self.model_name, .{
             .keep_recent = self.compaction_keep_recent,
             .max_summary_chars = self.compaction_max_summary_chars,
@@ -1923,6 +1926,7 @@ pub const Agent = struct {
     /// execute tools, and loop until a final text response is produced.
     pub fn turn(self: *Agent, user_message: []const u8) ![]const u8 {
         self.context_was_compacted = false;
+        self.last_turn_compacted = false;
         commands.refreshSubagentToolContext(self);
 
         const turn_input = commands.planTurnInput(user_message);
@@ -2067,6 +2071,10 @@ pub const Agent = struct {
             if (self.system_prompt_model_name) |cached_model| self.allocator.free(cached_model);
             self.system_prompt_model_name = try self.allocator.dupe(u8, turn_model_name);
         }
+
+        const pre_turn_compacted = self.autoCompactHistory() catch false;
+        self.last_turn_compacted = self.last_turn_compacted or pre_turn_compacted;
+        self.trimHistory();
 
         // Auto-save user message to memory (nanoTimestamp key to avoid collisions within the same second)
         if (self.auto_save) {
@@ -2593,7 +2601,8 @@ pub const Agent = struct {
                 });
 
                 // Auto-compaction before hard trimming to preserve context
-                self.last_turn_compacted = self.autoCompactHistory() catch false;
+                const compacted_now = self.autoCompactHistory() catch false;
+                self.last_turn_compacted = self.last_turn_compacted or compacted_now;
                 self.trimHistory();
 
                 // Auto-save assistant response
@@ -2885,7 +2894,8 @@ pub const Agent = struct {
         });
 
         // Compact/trim history so the next turn doesn't start with bloated context
-        self.last_turn_compacted = self.autoCompactHistory() catch false;
+        const compacted_now = self.autoCompactHistory() catch false;
+        self.last_turn_compacted = self.last_turn_compacted or compacted_now;
         self.trimHistory();
 
         const complete_event = ObserverEvent{ .turn_complete = {} };

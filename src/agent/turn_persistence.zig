@@ -6,6 +6,7 @@ const Agent = @import("root.zig").Agent;
 pub const TurnPersistenceState = struct {
     history: []const Agent.OwnedMessage,
     total_tokens: u64,
+    rewrite_session_history: bool = false,
 };
 
 fn persistedAssistantReply(history: []const Agent.OwnedMessage, response: []const u8) []const u8 {
@@ -13,6 +14,45 @@ fn persistedAssistantReply(history: []const Agent.OwnedMessage, response: []cons
     const last = history[history.len - 1];
     if (last.role != .assistant) return response;
     return last.content;
+}
+
+fn stripInjectedMemoryContext(content: []const u8) []const u8 {
+    if (!std.mem.startsWith(u8, content, "[Memory context]\n")) return content;
+    if (std.mem.indexOf(u8, content, "\n\n")) |sep| {
+        return content[sep + 2 ..];
+    }
+    return content;
+}
+
+fn shouldPersistAssistantHistory(content: []const u8) bool {
+    if (content.len == 0) return false;
+    if (std.mem.indexOf(u8, content, "<tool_call") != null) return false;
+    if (std.mem.indexOf(u8, content, "<tool_result") != null) return false;
+    return true;
+}
+
+fn rewriteCanonicalHistory(
+    store: memory_mod.SessionStore,
+    state: TurnPersistenceState,
+    session_key: []const u8,
+) void {
+    store.clearMessages(session_key) catch {};
+
+    for (state.history) |entry| {
+        switch (entry.role) {
+            .system, .tool => continue,
+            .user => {
+                const canonical_content = stripInjectedMemoryContext(entry.content);
+                if (std.mem.startsWith(u8, canonical_content, "SYSTEM:")) continue;
+                if (canonical_content.len == 0) continue;
+                store.saveMessage(session_key, "user", canonical_content) catch {};
+            },
+            .assistant => {
+                if (!shouldPersistAssistantHistory(entry.content)) continue;
+                store.saveMessage(session_key, "assistant", entry.content) catch {};
+            },
+        }
+    }
 }
 
 pub fn persistTurn(
@@ -31,6 +71,12 @@ pub fn persistTurn(
 
     if (commands.persistedRuntimeCommand(content)) |runtime_command| {
         store.saveMessage(session_key, memory_mod.RUNTIME_COMMAND_ROLE, runtime_command) catch {};
+    }
+
+    if (state.rewrite_session_history) {
+        rewriteCanonicalHistory(store, state, session_key);
+        store.saveUsage(session_key, state.total_tokens) catch {};
+        return;
     }
 
     if (turn_input.llm_user_message) |persisted_user| {

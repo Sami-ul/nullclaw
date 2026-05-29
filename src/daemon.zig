@@ -31,6 +31,7 @@ const outbound = @import("outbound.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const onboard = @import("onboard.zig");
 const streaming = @import("streaming.zig");
+const agent_mod = @import("agent/root.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const buildConversationContext = @import("agent/prompt.zig").buildConversationContext;
 const thread_stacks = @import("thread_stacks.zig");
@@ -1037,32 +1038,72 @@ const StreamingOutboundCtx = struct {
     emitted_chunk: bool = false,
 };
 
+const OUTBOUND_PROGRESS_PUBLISH_TIMEOUT_MS: u32 = 250;
+
 fn nextOutboundDraftId() u64 {
     return outbound_draft_id_counter.fetchAdd(1, .monotonic);
 }
 
-fn publishStreamingChunk(ctx_ptr: *anyopaque, event: streaming.Event) void {
-    if (event.stage != .chunk or event.text.len == 0) return;
-    const ctx: *StreamingOutboundCtx = @ptrCast(@alignCast(ctx_ptr));
+fn publishOutboundChunk(ctx: *StreamingOutboundCtx, text: []const u8) void {
+    if (text.len == 0) return;
 
     const out = if (ctx.account_id) |aid|
-        bus_mod.makeOutboundChunkWithAccount(ctx.allocator, ctx.channel, aid, ctx.chat_id, event.text)
+        bus_mod.makeOutboundChunkWithAccount(ctx.allocator, ctx.channel, aid, ctx.chat_id, text)
     else
-        bus_mod.makeOutboundChunk(ctx.allocator, ctx.channel, ctx.chat_id, event.text);
+        bus_mod.makeOutboundChunk(ctx.allocator, ctx.channel, ctx.chat_id, text);
 
     var message = out catch |err| {
         log.warn("inbound dispatch chunk makeOutbound failed: {}", .{err});
         return;
     };
     message.draft_id = ctx.draft_id;
-    ctx.event_bus.publishOutbound(message) catch |err| {
+    ctx.event_bus.publishOutboundTimeout(message, OUTBOUND_PROGRESS_PUBLISH_TIMEOUT_MS) catch |err| {
         message.deinit(ctx.allocator);
-        if (err != error.Closed) {
-            log.warn("inbound dispatch chunk publishOutbound failed: {}", .{err});
+        switch (err) {
+            error.Closed => {},
+            error.Timeout => log.warn("inbound dispatch chunk publishOutbound timed out", .{}),
         }
         return;
     };
     ctx.emitted_chunk = true;
+}
+
+fn publishStreamingChunk(ctx_ptr: *anyopaque, event: streaming.Event) void {
+    if (event.stage != .chunk or event.text.len == 0) return;
+    const ctx: *StreamingOutboundCtx = @ptrCast(@alignCast(ctx_ptr));
+    publishOutboundChunk(ctx, event.text);
+}
+
+fn publishProgressHint(ctx_ptr: *anyopaque, hint: agent_mod.ProgressHint) void {
+    const ctx: *StreamingOutboundCtx = @ptrCast(@alignCast(ctx_ptr));
+    if (hint.text.len == 0) return;
+    const text = std.fmt.allocPrint(ctx.allocator, "\n\nWorking: `{s}`\n", .{hint.text}) catch return;
+    defer ctx.allocator.free(text);
+    publishOutboundChunk(ctx, text);
+}
+
+fn publishDraftCleanup(ctx: *StreamingOutboundCtx) void {
+    if (!ctx.emitted_chunk) return;
+    if (ctx.draft_id == 0) return;
+
+    const out = if (ctx.account_id) |aid|
+        bus_mod.makeOutboundWithAccount(ctx.allocator, ctx.channel, aid, ctx.chat_id, "")
+    else
+        bus_mod.makeOutbound(ctx.allocator, ctx.channel, ctx.chat_id, "");
+
+    var message = out catch |err| {
+        log.warn("inbound dispatch draft cleanup makeOutbound failed: {}", .{err});
+        return;
+    };
+    message.draft_id = ctx.draft_id;
+    ctx.event_bus.publishOutboundTimeout(message, OUTBOUND_PROGRESS_PUBLISH_TIMEOUT_MS) catch |err| {
+        message.deinit(ctx.allocator);
+        switch (err) {
+            error.Closed => {},
+            error.Timeout => log.warn("inbound dispatch draft cleanup publishOutbound timed out", .{}),
+        }
+        return;
+    };
 }
 
 fn makeAssistantReplyOutbound(
@@ -1324,6 +1365,17 @@ fn processInboundMessage(
         };
         stream_sink = makeStreamingSinkForChannel(use_streaming_outbound, raw_sink, &outbound_tag_filter);
     }
+    const progress_sink: ?agent_mod.ProgressSink = if (use_streaming_outbound)
+        .{
+            .callback = publishProgressHint,
+            .ctx = @ptrCast(&streaming_ctx),
+        }
+    else
+        null;
+
+    if (outbound_draft_id != 0) {
+        publishOutboundChunk(&streaming_ctx, "Working...");
+    }
 
     if (std.mem.eql(u8, msg.channel, "max")) {
         channels_mod.max.setInteractiveOwnerContext(msg.sender_id);
@@ -1335,7 +1387,7 @@ fn processInboundMessage(
         msg.content,
         routing_plan.conversation_context,
         stream_sink,
-        null,
+        progress_sink,
     ) catch |err| {
         log.warn("inbound dispatch process failed: {}", .{err});
 
@@ -1384,6 +1436,7 @@ fn processInboundMessage(
                 .message_id = parsed_meta.fields.message_id.?,
                 .payload = payload.payload(),
             })) |_| {
+                publishDraftCleanup(&streaming_ctx);
                 return;
             } else |err| {
                 log.warn("editMessage failed; falling back to normal outbound: {}", .{err});
