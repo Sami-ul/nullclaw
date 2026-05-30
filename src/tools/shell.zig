@@ -20,6 +20,8 @@ const createSandbox = @import("../security/sandbox.zig").createSandbox;
 
 /// Default maximum shell command execution time (nanoseconds).
 const DEFAULT_SHELL_TIMEOUT_NS: u64 = 60 * std.time.ns_per_s;
+/// Default maximum time a shell command may produce no stdout/stderr progress.
+const DEFAULT_SHELL_IDLE_TIMEOUT_NS: u64 = 10 * 60 * std.time.ns_per_s;
 /// Default maximum output size in bytes (1MB).
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 1_048_576;
 /// Environment variables safe to pass to shell commands.
@@ -130,11 +132,25 @@ fn unwrapMarkdownFence(command: []const u8) ?[]const u8 {
     return trimmed_content;
 }
 
+fn requestedSecondsToNs(raw_seconds: i64) ?u64 {
+    if (raw_seconds <= 0) return null;
+    const seconds: u64 = @intCast(raw_seconds);
+    const max_seconds = std.math.maxInt(u64) / std.time.ns_per_s;
+    return @min(seconds, max_seconds) * std.time.ns_per_s;
+}
+
+fn effectiveTimeoutNs(args: JsonObjectMap, key: []const u8, cap_ns: u64) u64 {
+    const requested_ns = requestedSecondsToNs(root.getInt(args, key) orelse return cap_ns) orelse return cap_ns;
+    if (cap_ns == 0) return requested_ns;
+    return @min(requested_ns, cap_ns);
+}
+
 /// Shell command execution tool with workspace scoping.
 pub const ShellTool = struct {
     workspace_dir: []const u8,
     allowed_paths: []const []const u8 = &.{},
     timeout_ns: u64 = DEFAULT_SHELL_TIMEOUT_NS,
+    idle_timeout_ns: u64 = DEFAULT_SHELL_IDLE_TIMEOUT_NS,
     max_output_bytes: usize = DEFAULT_MAX_OUTPUT_BYTES,
     policy: ?*const SecurityPolicy = null,
     /// Env var names whose platform path-list values are validated
@@ -148,9 +164,9 @@ pub const ShellTool = struct {
     sandbox_allocator: ?std.mem.Allocator = null,
     sandbox_mu: std_compat.sync.Mutex = .{},
     pub const tool_name = "shell";
-    pub const tool_description = "Execute a shell command in the workspace directory";
+    pub const tool_description = "Execute a shell command in the workspace directory. For browser automation, job applications, installs, builds, or other long work, print concise progress periodically so the user can watch the run and the runtime can distinguish active work from a hang.";
     pub const tool_params =
-        \\{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"},"cwd":{"type":"string","description":"Working directory (absolute path within allowed paths; defaults to workspace)"}},"required":["command"]}
+        \\{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"},"cwd":{"type":"string","description":"Working directory (absolute path within allowed paths; defaults to workspace)"},"timeout_secs":{"type":"integer","description":"Optional wall timeout in seconds, capped by the configured shell timeout"},"idle_timeout_secs":{"type":"integer","description":"Optional no-output timeout in seconds, capped by the configured shell idle timeout"}},"required":["command"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -306,13 +322,16 @@ pub const ShellTool = struct {
         // Apply sandbox wrapper if configured.
         var wrap_buf: [512][]const u8 = undefined;
         const final_argv = try wrapCommandArgv(sandbox, base_argv, &wrap_buf);
+        const command_timeout_ns = effectiveTimeoutNs(args, "timeout_secs", self.timeout_ns);
+        const command_idle_timeout_ns = effectiveTimeoutNs(args, "idle_timeout_secs", self.idle_timeout_ns);
 
         // Execute command.
         const result = try proc.run(allocator, final_argv, .{
             .cwd = effective_cwd,
             .env_map = &env,
             .max_output_bytes = self.max_output_bytes,
-            .timeout_ns = self.timeout_ns,
+            .timeout_ns = command_timeout_ns,
+            .idle_timeout_ns = command_idle_timeout_ns,
         });
         defer allocator.free(result.stderr);
 
@@ -325,8 +344,16 @@ pub const ShellTool = struct {
         if (result.interrupted) {
             return ToolResult{ .success = false, .output = "", .error_msg = "Interrupted by /stop" };
         }
+        if (result.idle_timed_out) {
+            const msg = try std.fmt.allocPrint(
+                allocator,
+                "Command stopped after {d}s without stdout/stderr progress. For long browser or job-application work, print progress periodically or run it as a background job.",
+                .{command_idle_timeout_ns / std.time.ns_per_s},
+            );
+            return ToolResult{ .success = false, .output = "", .error_msg = msg };
+        }
         if (result.timed_out) {
-            const msg = try std.fmt.allocPrint(allocator, "Command timed out after {d}s", .{self.timeout_ns / std.time.ns_per_s});
+            const msg = try std.fmt.allocPrint(allocator, "Command timed out after {d}s", .{command_timeout_ns / std.time.ns_per_s});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         }
         if (result.exit_code != null) {

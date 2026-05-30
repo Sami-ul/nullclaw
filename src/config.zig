@@ -1451,6 +1451,7 @@ pub const Config = struct {
         // Tools (with media.audio)
         try w.print("  \"tools\": {{\n", .{});
         try w.print("    \"shell_timeout_secs\": {d},\n", .{self.tools.shell_timeout_secs});
+        try w.print("    \"shell_idle_timeout_secs\": {d},\n", .{self.tools.shell_idle_timeout_secs});
         try w.print("    \"shell_max_output_bytes\": {d},\n", .{self.tools.shell_max_output_bytes});
         try w.print("    \"max_file_size_bytes\": {d},\n", .{self.tools.max_file_size_bytes});
         try w.print("    \"web_fetch_max_chars\": {d},\n", .{self.tools.web_fetch_max_chars});

@@ -1691,6 +1691,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (tl.object.get("shell_timeout_secs")) |v| {
                 if (v == .integer) self.tools.shell_timeout_secs = @intCast(v.integer);
             }
+            if (tl.object.get("shell_idle_timeout_secs")) |v| {
+                if (v == .integer) self.tools.shell_idle_timeout_secs = @intCast(v.integer);
+            }
             if (tl.object.get("shell_max_output_bytes")) |v| {
                 if (v == .integer) self.tools.shell_max_output_bytes = @intCast(v.integer);
             }

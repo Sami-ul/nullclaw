@@ -444,6 +444,7 @@ pub const ToolCustomization = struct {
 
 pub const ToolsConfig = struct {
     shell_timeout_secs: u64 = 60,
+    shell_idle_timeout_secs: u64 = 600,
     shell_max_output_bytes: u32 = 1_048_576, // 1MB
     max_file_size_bytes: u32 = 10_485_760, // 10MB — shared file_read/edit/append
     web_fetch_max_chars: u32 = 100_000,

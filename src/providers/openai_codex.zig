@@ -425,6 +425,7 @@ fn codexStreamRequest(
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
+    http_util.configureCurlChild(&child);
 
     try child.spawn();
 

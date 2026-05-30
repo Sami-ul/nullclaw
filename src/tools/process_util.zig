@@ -1,6 +1,7 @@
 const std = @import("std");
 const std_compat = @import("compat");
 const AtomicBool = std.atomic.Value(bool);
+const AtomicI64 = std.atomic.Value(i64);
 const builtin = @import("builtin");
 
 // Win32 APIs used for codepage fallback decoding on Windows.
@@ -50,6 +51,38 @@ pub fn setThreadInterruptFlag(flag: ?*const AtomicBool) void {
     thread_interrupt_flag = flag;
 }
 
+pub const ProgressKind = enum {
+    stdout,
+    stderr,
+    heartbeat,
+    timeout,
+    idle_timeout,
+};
+
+pub const ProgressEvent = struct {
+    kind: ProgressKind,
+    text: []const u8,
+};
+
+pub const ProgressCallback = *const fn (ctx: *anyopaque, event: ProgressEvent) void;
+
+pub const ProgressSink = struct {
+    callback: ProgressCallback,
+    ctx: *anyopaque,
+};
+
+threadlocal var thread_progress_sink: ?ProgressSink = null;
+
+pub fn setThreadProgressSink(sink: ?ProgressSink) ?ProgressSink {
+    const previous = thread_progress_sink;
+    thread_progress_sink = sink;
+    return previous;
+}
+
+fn emitProgress(event: ProgressEvent) void {
+    if (thread_progress_sink) |sink| sink.callback(sink.ctx, event);
+}
+
 /// Result of a child process execution.
 pub const RunResult = struct {
     stdout: []u8,
@@ -58,6 +91,7 @@ pub const RunResult = struct {
     exit_code: ?u32 = null,
     interrupted: bool = false,
     timed_out: bool = false,
+    idle_timed_out: bool = false,
 
     /// Free both stdout and stderr buffers.
     pub fn deinit(self: *const RunResult, allocator: std.mem.Allocator) void {
@@ -73,15 +107,27 @@ pub const RunOptions = struct {
     max_output_bytes: usize = 1_048_576,
     cancel_flag: ?*const AtomicBool = null,
     timeout_ns: ?u64 = null,
+    idle_timeout_ns: ?u64 = null,
 };
 
 const ProcessWatcherCtx = struct {
     child: *std_compat.process.Child,
     cancel_flag: ?*const AtomicBool,
     timeout_ns: ?u64,
+    idle_timeout_ns: ?u64,
+    last_output_ns: *AtomicI64,
     done: *AtomicBool,
     timed_out: *AtomicBool,
+    idle_timed_out: *AtomicBool,
 };
+
+const OUTPUT_PROGRESS_MIN_INTERVAL_NS: i64 = 2 * std.time.ns_per_s;
+const NO_OUTPUT_PROGRESS_INTERVAL_NS: i64 = 60 * std.time.ns_per_s;
+const OUTPUT_PROGRESS_MAX_BYTES: usize = 512;
+
+fn nowNsI64() i64 {
+    return std.math.cast(i64, std_compat.time.nanoTimestamp()) orelse std.math.maxInt(i64);
+}
 
 fn terminateWindowsProcessTreeByPid(pid: std.os.windows.DWORD) void {
     if (pid == 0) return;
@@ -134,8 +180,21 @@ fn processWatcherMain(ctx: *ProcessWatcherCtx) void {
         if (ctx.timeout_ns) |limit| {
             if (waited_ns >= limit) {
                 ctx.timed_out.store(true, .release);
+                emitProgress(.{ .kind = .timeout, .text = "wall timeout reached; stopping command process group" });
                 terminateChild(ctx.child);
                 break;
+            }
+        }
+        if (ctx.idle_timeout_ns) |limit| {
+            if (limit > 0) {
+                const last_output = ctx.last_output_ns.load(.acquire);
+                const now = nowNsI64();
+                if (now > last_output and @as(u64, @intCast(now - last_output)) >= limit) {
+                    ctx.idle_timed_out.store(true, .release);
+                    emitProgress(.{ .kind = .idle_timeout, .text = "no stdout/stderr progress before idle timeout; stopping command process group" });
+                    terminateChild(ctx.child);
+                    break;
+                }
             }
         }
         std_compat.thread.sleep(poll_ns);
@@ -284,6 +343,119 @@ fn normalizeCapturedOutputOwned(allocator: std.mem.Allocator, input: []u8) ![]u8
     return lossy;
 }
 
+const CapturedOutput = struct {
+    stdout: []u8,
+    stderr: []u8,
+};
+
+const OutputProgressState = struct {
+    last_output_emit_ns: i64 = 0,
+    last_heartbeat_emit_ns: i64 = 0,
+};
+
+fn previewProgressChunk(chunk: []const u8) []const u8 {
+    return chunk[0..@min(chunk.len, OUTPUT_PROGRESS_MAX_BYTES)];
+}
+
+fn maybeEmitOutputProgress(state: *OutputProgressState, kind: ProgressKind, chunk: []const u8) void {
+    if (chunk.len == 0 or thread_progress_sink == null) return;
+    if (!std.unicode.utf8ValidateSlice(chunk)) return;
+    const now = nowNsI64();
+    if (state.last_output_emit_ns != 0 and now - state.last_output_emit_ns < OUTPUT_PROGRESS_MIN_INTERVAL_NS) return;
+    state.last_output_emit_ns = now;
+    state.last_heartbeat_emit_ns = now;
+    emitProgress(.{ .kind = kind, .text = previewProgressChunk(chunk) });
+}
+
+fn maybeEmitNoOutputHeartbeat(state: *OutputProgressState, last_output_ns: *AtomicI64) void {
+    if (thread_progress_sink == null) return;
+    const now = nowNsI64();
+    if (state.last_heartbeat_emit_ns == 0) state.last_heartbeat_emit_ns = now;
+    if (now - state.last_heartbeat_emit_ns < NO_OUTPUT_PROGRESS_INTERVAL_NS) return;
+
+    const last_output = last_output_ns.load(.acquire);
+    const idle_secs: i64 = if (now > last_output) @divTrunc(now - last_output, std.time.ns_per_s) else 0;
+    var buf: [96]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, "still running; no stdout/stderr for {d}s", .{idle_secs}) catch "still running; no stdout/stderr";
+    state.last_heartbeat_emit_ns = now;
+    emitProgress(.{ .kind = .heartbeat, .text = text });
+}
+
+fn appendPipeRead(
+    allocator: std.mem.Allocator,
+    file: anytype,
+    out: *std.ArrayList(u8),
+    max_output_bytes: usize,
+    last_output_ns: *AtomicI64,
+    progress_state: *OutputProgressState,
+    progress_kind: ProgressKind,
+    read_any: *bool,
+) !bool {
+    var read_buf: [4096]u8 = undefined;
+    const n = file.read(&read_buf) catch |err| switch (err) {
+        error.WouldBlock => return true,
+        else => return err,
+    };
+    if (n == 0) return false;
+
+    try out.appendSlice(allocator, read_buf[0..n]);
+    if (out.items.len > max_output_bytes) return error.ProcessOutputTooLarge;
+    last_output_ns.store(nowNsI64(), .release);
+    read_any.* = true;
+    maybeEmitOutputProgress(progress_state, progress_kind, read_buf[0..n]);
+    return true;
+}
+
+fn collectOutputPosix(
+    allocator: std.mem.Allocator,
+    child: *std_compat.process.Child,
+    max_output_bytes: usize,
+    last_output_ns: *AtomicI64,
+) !CapturedOutput {
+    const stdout_file = child.stdout.?;
+    const stderr_file = child.stderr.?;
+    var stdout_open = true;
+    var stderr_open = true;
+    var stdout: std.ArrayList(u8) = .empty;
+    errdefer stdout.deinit(allocator);
+    var stderr: std.ArrayList(u8) = .empty;
+    errdefer stderr.deinit(allocator);
+    var progress_state = OutputProgressState{
+        .last_output_emit_ns = 0,
+        .last_heartbeat_emit_ns = nowNsI64(),
+    };
+
+    while (stdout_open or stderr_open) {
+        var read_any = false;
+        var poll_fds = [_]std.posix.pollfd{
+            .{
+                .fd = if (stdout_open) stdout_file.handle else -1,
+                .events = if (stdout_open) std.posix.POLL.IN | std.posix.POLL.HUP else 0,
+                .revents = 0,
+            },
+            .{
+                .fd = if (stderr_open) stderr_file.handle else -1,
+                .events = if (stderr_open) std.posix.POLL.IN | std.posix.POLL.HUP else 0,
+                .revents = 0,
+            },
+        };
+        _ = try std.posix.poll(&poll_fds, 100);
+
+        if (stdout_open and (poll_fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) != 0) {
+            stdout_open = try appendPipeRead(allocator, stdout_file, &stdout, max_output_bytes, last_output_ns, &progress_state, .stdout, &read_any);
+        }
+        if (stderr_open and (poll_fds[1].revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) != 0) {
+            stderr_open = try appendPipeRead(allocator, stderr_file, &stderr, max_output_bytes, last_output_ns, &progress_state, .stderr, &read_any);
+        }
+        if (!read_any) maybeEmitNoOutputHeartbeat(&progress_state, last_output_ns);
+    }
+
+    return .{
+        .stdout = try stdout.toOwnedSlice(allocator),
+        .stderr = try stderr.toOwnedSlice(allocator),
+    };
+}
+
 /// Run a child process, capture stdout and stderr, and return the result.
 ///
 /// The caller owns the returned stdout and stderr buffers.
@@ -308,23 +480,36 @@ pub fn run(
     if (opts.env_map) |env| child.env_map = env;
 
     try child.spawn();
+    errdefer {
+        terminateChild(&child);
+        _ = child.wait() catch {};
+    }
 
     const effective_cancel_flag = opts.cancel_flag orelse thread_interrupt_flag;
     const effective_timeout_ns = if (opts.timeout_ns) |limit|
         if (limit == 0) null else limit
     else
         null;
+    const effective_idle_timeout_ns = if (opts.idle_timeout_ns) |limit|
+        if (limit == 0) null else limit
+    else
+        null;
     var cancel_done = AtomicBool.init(false);
     var timed_out = AtomicBool.init(false);
+    var idle_timed_out = AtomicBool.init(false);
+    var last_output_ns = AtomicI64.init(nowNsI64());
     var cancel_watcher: ?std.Thread = null;
     var watcher_ctx: ProcessWatcherCtx = undefined;
-    if (effective_cancel_flag != null or effective_timeout_ns != null) {
+    if (effective_cancel_flag != null or effective_timeout_ns != null or effective_idle_timeout_ns != null) {
         watcher_ctx = .{
             .child = &child,
             .cancel_flag = effective_cancel_flag,
             .timeout_ns = effective_timeout_ns,
+            .idle_timeout_ns = effective_idle_timeout_ns,
+            .last_output_ns = &last_output_ns,
             .done = &cancel_done,
             .timed_out = &timed_out,
+            .idle_timed_out = &idle_timed_out,
         };
         cancel_watcher = std.Thread.spawn(.{}, processWatcherMain, .{&watcher_ctx}) catch null;
     }
@@ -333,40 +518,61 @@ pub fn run(
         if (cancel_watcher) |t| t.join();
     }
 
-    var stdout = if (child.stdout) |stdout_file| blk: {
-        break :blk stdout_file.readToEndAlloc(allocator, opts.max_output_bytes) catch |err| {
-            if (wasInterrupted(effective_cancel_flag) or timed_out.load(.acquire)) {
-                break :blk try allocator.dupe(u8, "");
+    var stdout: []u8 = undefined;
+    var stderr: []u8 = undefined;
+    collect_output: {
+        if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+            const captured = collectOutputPosix(allocator, &child, opts.max_output_bytes, &last_output_ns) catch |err| {
+                if (wasInterrupted(effective_cancel_flag) or timed_out.load(.acquire) or idle_timed_out.load(.acquire)) {
+                    stdout = try allocator.dupe(u8, "");
+                    stderr = try allocator.dupe(u8, "");
+                    break :collect_output;
+                }
+                return err;
+            };
+            stdout = captured.stdout;
+            stderr = captured.stderr;
+            break :collect_output;
+        }
+
+        stdout = if (child.stdout) |stdout_file| stdout_file.readToEndAlloc(allocator, opts.max_output_bytes) catch |err| {
+            if (wasInterrupted(effective_cancel_flag) or timed_out.load(.acquire) or idle_timed_out.load(.acquire)) {
+                stdout = try allocator.dupe(u8, "");
+                stderr = try allocator.dupe(u8, "");
+                break :collect_output;
             }
             return err;
-        };
-    } else try allocator.dupe(u8, "");
+        } else try allocator.dupe(u8, "");
+        stderr = if (child.stderr) |stderr_file| stderr_file.readToEndAlloc(allocator, opts.max_output_bytes) catch |err| {
+            if (wasInterrupted(effective_cancel_flag) or timed_out.load(.acquire) or idle_timed_out.load(.acquire)) {
+                allocator.free(stdout);
+                stdout = try allocator.dupe(u8, "");
+                stderr = try allocator.dupe(u8, "");
+                break :collect_output;
+            }
+            return err;
+        } else try allocator.dupe(u8, "");
+    }
     errdefer allocator.free(stdout);
     stdout = try normalizeCapturedOutputOwned(allocator, stdout);
 
-    var stderr = if (child.stderr) |stderr_file| blk: {
-        break :blk stderr_file.readToEndAlloc(allocator, opts.max_output_bytes) catch |err| {
-            if (wasInterrupted(effective_cancel_flag) or timed_out.load(.acquire)) {
-                break :blk try allocator.dupe(u8, "");
-            }
-            return err;
-        };
-    } else try allocator.dupe(u8, "");
     errdefer allocator.free(stderr);
     stderr = try normalizeCapturedOutputOwned(allocator, stderr);
 
     const term = try child.wait();
     const interrupted = wasInterrupted(effective_cancel_flag);
     const did_time_out = timed_out.load(.acquire);
+    const did_idle_time_out = idle_timed_out.load(.acquire);
 
     return switch (term) {
         .exited => |code| .{
             .stdout = stdout,
             .stderr = stderr,
-            .success = code == 0,
+            .success = code == 0 and !interrupted and !did_time_out and !did_idle_time_out,
             .exit_code = code,
             .interrupted = interrupted,
             .timed_out = did_time_out,
+            .idle_timed_out = did_idle_time_out,
         },
         else => .{
             .stdout = stdout,
@@ -375,6 +581,7 @@ pub fn run(
             .exit_code = null,
             .interrupted = interrupted,
             .timed_out = did_time_out,
+            .idle_timed_out = did_idle_time_out,
         },
     };
 }

@@ -848,6 +848,7 @@ pub fn curlStreamAnthropic(
     var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
+    http_util.configureCurlChild(&child);
 
     try child.spawn();
 

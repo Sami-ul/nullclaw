@@ -79,6 +79,51 @@ pub const ProgressSink = struct {
     }
 };
 
+const ProcessProgressBridge = struct {
+    agent: *Agent,
+    allocator: std.mem.Allocator,
+    tool_name: []const u8,
+
+    fn normalizeKind(kind: tools_mod.process_util.ProgressKind) []const u8 {
+        return switch (kind) {
+            .stdout => "stdout",
+            .stderr => "stderr",
+            .heartbeat => "running",
+            .timeout => "timeout",
+            .idle_timeout => "idle-timeout",
+        };
+    }
+
+    fn oneLinePreview(text: []const u8) []const u8 {
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (trimmed.len == 0) return "(output)";
+        var end: usize = 0;
+        while (end < trimmed.len and end < 180) : (end += 1) {
+            if (trimmed[end] == '\n' or trimmed[end] == '\r') break;
+        }
+        return trimmed[0..end];
+    }
+
+    fn onEvent(ctx_ptr: *anyopaque, event: tools_mod.process_util.ProgressEvent) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
+        const cb = self.agent.progress_callback orelse return;
+        const pctx = self.agent.progress_ctx orelse return;
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const alloc = arena.allocator();
+
+        const safe_text = self.agent.safeToolDiagnosticText(alloc, event.text);
+        const preview = oneLinePreview(safe_text);
+        const text = std.fmt.allocPrint(
+            alloc,
+            "{s} {s}: {s}",
+            .{ self.tool_name, normalizeKind(event.kind), preview },
+        ) catch return;
+        cb(pctx, .{ .text = text });
+    }
+};
+
 /// Callback invoked at each tool-loop boundary to drain a pending mid-turn injection.
 /// Returns an owned slice allocated with the provided allocator, or null if empty.
 pub const DrainCallback = *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) anyerror!?[]u8;
@@ -3141,6 +3186,16 @@ pub const Agent = struct {
                 defer self.clearActiveToolName();
                 tools_mod.process_util.setThreadInterruptFlag(&self.interrupt_requested);
                 defer tools_mod.process_util.setThreadInterruptFlag(null);
+                var process_progress_bridge = ProcessProgressBridge{
+                    .agent = self,
+                    .allocator = tool_allocator,
+                    .tool_name = trimmed_call_name,
+                };
+                const previous_process_progress_sink = tools_mod.process_util.setThreadProgressSink(.{
+                    .callback = ProcessProgressBridge.onEvent,
+                    .ctx = @ptrCast(&process_progress_bridge),
+                });
+                defer _ = tools_mod.process_util.setThreadProgressSink(previous_process_progress_sink);
                 @import("../http_util.zig").setThreadInterruptFlag(&self.interrupt_requested);
                 defer @import("../http_util.zig").setThreadInterruptFlag(null);
                 const previous_memory_session_id = tools_mod.setThreadMemorySessionId(self.memory_session_id);

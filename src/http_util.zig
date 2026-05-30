@@ -111,14 +111,30 @@ const CancelWatcherCtx = struct {
 fn cancelWatcherMain(ctx: *CancelWatcherCtx) void {
     while (!ctx.done.load(.acquire)) {
         if (ctx.cancel_flag.load(.acquire)) {
-            if (comptime @import("builtin").os.tag == .windows) {
-                _ = ctx.child.kill() catch {};
-            } else {
-                std.posix.kill(ctx.child.id, std.posix.SIG.TERM) catch {};
-            }
+            terminateCurlChild(ctx.child);
             break;
         }
         std_compat.thread.sleep(20 * std.time.ns_per_ms);
+    }
+}
+
+pub fn configureCurlChild(child: *std_compat.process.Child) void {
+    if (comptime @import("builtin").os.tag != .windows and @import("builtin").os.tag != .wasi) {
+        child.pgid = 0;
+    }
+}
+
+pub fn terminateCurlChild(child: *std_compat.process.Child) void {
+    if (comptime @import("builtin").os.tag == .windows) {
+        _ = child.kill() catch {};
+    } else if (comptime @import("builtin").os.tag == .wasi) {
+        return;
+    } else {
+        const process_group_id: std.posix.pid_t = -child.id;
+        std.posix.kill(process_group_id, std.posix.SIG.TERM) catch {
+            std.posix.kill(child.id, std.posix.SIG.TERM) catch {};
+            return;
+        };
     }
 }
 
@@ -425,6 +441,7 @@ fn curlRequestWithProxy(
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
+    configureCurlChild(&child);
 
     try child.spawn();
     const cancel_flag = thread_interrupt_flag;
@@ -573,6 +590,7 @@ pub fn curlPostWithStatusAndTimeoutAndResolve(
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
+    configureCurlChild(&child);
 
     try child.spawn();
     const cancel_flag = thread_interrupt_flag;
@@ -697,6 +715,7 @@ pub fn curlPostWithStatusHeadersAndTimeoutAndResolve(
     child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
+    configureCurlChild(&child);
 
     try child.spawn();
     const cancel_flag = thread_interrupt_flag;
@@ -830,6 +849,7 @@ pub fn curlGetWithStatusAndTimeoutAndResolve(
     var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
+    configureCurlChild(&child);
 
     try child.spawn();
     const cancel_flag = thread_interrupt_flag;
@@ -941,6 +961,7 @@ fn curlGetWithProxyAndResolve(
     var child = std_compat.process.Child.init(argv_buf[0..argc], allocator);
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
+    configureCurlChild(&child);
 
     try child.spawn();
     const cancel_flag = thread_interrupt_flag;
@@ -1173,6 +1194,7 @@ pub fn curlGetSSE(
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
+    configureCurlChild(&child);
 
     child.spawn() catch |err| {
         log.err("curl GET-SSE spawn failed: {}", .{err});
